@@ -354,9 +354,17 @@ impl ArchiveWriter {
         f.write_all(&(total + TRAILER_SIZE as u64).to_le_bytes())
             .map_err(io_err("writing archive"))?;
         f.sync_all().map_err(io_err("writing archive"))?;
-        tmp.persist(&self.out_path).map_err(|e| Error::Io {
+        let (_, tmp_path) = tmp.keep().map_err(|e| Error::Io {
             context: format!("saving {}", self.out_path.display()),
             source: e.error,
+        })?;
+        // std::fs::rename adds the \?\ prefix for long paths on Windows; MoveFileEx alone does not
+        fs::rename(&tmp_path, &self.out_path).map_err(|e| {
+            let _ = fs::remove_file(&tmp_path);
+            Error::Io {
+                context: format!("saving {}", self.out_path.display()),
+                source: e,
+            }
         })?;
         Ok(self.entries)
     }
@@ -965,10 +973,17 @@ impl Archive {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o755));
             }
-            let f = tmp.persist(&target).map_err(|err| Error::Io {
+            let (f, tmp_path) = tmp.keep().map_err(|err| Error::Io {
                 context: format!("saving {}", target.display()),
                 source: err.error,
             })?;
+            if let Err(err) = fs::rename(&tmp_path, &target) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(Error::Io {
+                    context: format!("saving {}", target.display()),
+                    source: err,
+                });
+            }
             let _ = f.set_modified(mtime_to_system(e.mtime));
             report.written.push(e.path.clone());
             done += e.size;
