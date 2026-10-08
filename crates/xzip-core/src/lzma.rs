@@ -192,6 +192,8 @@ pub struct Stats {
     pub lzma_chunks: u64,
     pub stored_chunks: u64,
     pub skipped_bytes: u64,
+    /// Pre-filter actually applied (set by the .xz layer).
+    pub filter: Option<crate::filters::Filter>,
 }
 
 impl Stats {

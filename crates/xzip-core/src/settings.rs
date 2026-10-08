@@ -32,8 +32,16 @@ pub struct Settings {
     pub lc: u32,
     pub lp: u32,
     pub pb: u32,
-    pub auto_props: bool, // pick lc/lp/pb by trial on a sample
-    pub min_slice: usize, // smallest slice a thread encodes on its own
+    pub auto_props: bool,   // pick lc/lp/pb by trial on a sample
+    pub min_slice: usize,   // smallest slice a thread encodes on its own
+    pub filter: FilterMode, // pre-filter for machine code / interleaved data
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterMode {
+    /// Sniff executable headers and run a quick trial; keep a filter only if it helps.
+    Auto,
+    Fixed(crate::filters::Filter),
 }
 
 impl Default for Settings {
@@ -66,6 +74,7 @@ impl Settings {
             pb: 2,
             auto_props: true,
             min_slice: 1 << 17,
+            filter: FilterMode::Auto,
         };
         match level {
             0 => Settings {

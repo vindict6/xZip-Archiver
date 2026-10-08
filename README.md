@@ -8,12 +8,19 @@ line tool, no runtime to install.
 
 ![xZip Archiver](docs/screenshot.png)
 
+![Welcome screen](docs/hero.png)
+
 ## What you get
 
 - **Fast-LZMA2 compression, written from scratch.** A radix match finder, a fast
   greedy parser and an optimal parser, automatic context tuning, parallel
   encoding across all cores. Output is plain `.xz` inside, so the streams are
-  readable by `xz`, 7-Zip and liblzma. Levels 6+ typically beat `xz -9e` on binaries.
+  readable by `xz`, 7-Zip and liblzma.
+- **Executable filters, picked automatically.** x86, ARM64, ARM, ARM-Thumb,
+  PowerPC and SPARC branch-target filters (plus Delta for interleaved data), the
+  same ones xz uses, bit for bit. The file header says which one applies; a quick
+  trial confirms it helps. A 42 MB x86-64 shared library: RAR 9.0 MB, xz -9e
+  9.2 MB, **xzip -l 9: 8.8 MB**.
 - **Verified before parsed.** The whole archive is SHA-256 hashed and compared
   with its trailer before a single header field is read. Then the header CRC,
   then the manifest hash, then every field's bounds and every path. A file's
@@ -62,7 +69,8 @@ xzip completions zsh > ~/.zfunc/_xzip          # bash, zsh, fish, powershell, el
 xzip man > xzip.1
 ```
 
-Useful flags: `-l 0..9` level, `-T N` threads, `-x GLOB` exclude (repeatable;
+Useful flags: `-l 0..9` level, `-T N` threads, `--filter auto|none|x86|arm64|arm|armthumb|powerpc|sparc|delta:N`,
+`-x GLOB` exclude (repeatable;
 matches names, paths or parent folders), `--include GLOB`, `-C DIR`, `-f` replace
 existing files on extract (default is to keep them and warn), `--dry-run`,
 `--json` for scripts, `-q` / `-v`, `--no-progress`, `--color auto|always|never`.

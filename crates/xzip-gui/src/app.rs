@@ -1,4 +1,4 @@
-//! The window: toolbar, sidebar, file table, details, dialogs, background jobs.
+//! The window: header, sidebar, file table, details, dialogs, background jobs.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -7,16 +7,16 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use egui::{Align, Color32, Id, Layout, RichText, Sense, Vec2};
+use egui::{Align, Align2, Color32, FontId, Id, Layout, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as ph;
 
 use xzip_core::archive::{
     self, Archive, CreateOptions, Entry, ExtractOptions, ExtractReport, Overwrite, Skipped,
 };
-use xzip_core::{format_size, Settings};
+use xzip_core::{format_size, Filter, FilterMode, Settings};
 
-use crate::theme::{self, Palette};
+use crate::theme::{self, Accent, Palette};
 
 const RECENT_MAX: usize = 8;
 const SECURITY_NOTES: &str = "\
@@ -109,6 +109,8 @@ enum SortCol {
 
 pub struct App {
     dark: bool,
+    accent: Accent,
+    pal: Palette,
     archive: Option<Arc<Archive>>,
     folder: String,
     selection: HashSet<String>,
@@ -117,14 +119,14 @@ pub struct App {
     recent: Vec<PathBuf>,
     level: u32,
     threads: usize,
+    filter_auto: bool,
+    open_after: bool,
     show_details: bool,
     sort: (SortCol, bool),
     job: Option<Job>,
     toasts: Vec<Toast>,
     dialog: Dialog,
     status: String,
-    verified_label: String,
-    fonts_ready: bool,
     screenshot: Option<PathBuf>,
     frames: u32,
 }
@@ -138,29 +140,61 @@ struct Row {
     packed: u64,
     mtime: i64,
     icon: &'static str,
+    tint: Tint,
 }
 
-fn icon_for(name: &str, is_dir: bool) -> &'static str {
+#[derive(Clone, Copy)]
+enum Tint {
+    Folder,
+    Image,
+    Media,
+    Archive,
+    Document,
+    Code,
+    Binary,
+    Plain,
+}
+
+fn classify(name: &str, is_dir: bool) -> (&'static str, Tint) {
     if is_dir {
-        return ph::FOLDER;
+        return (ph::FOLDER, Tint::Folder);
     }
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "tiff" | "heic" => ph::IMAGE,
-        "mp4" | "mkv" | "mov" | "avi" | "webm" => ph::FILM_STRIP,
-        "mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac" => ph::MUSIC_NOTE,
-        "zip" | "xzip" | "xz" | "7z" | "rar" | "gz" | "tar" | "zst" | "bz2" => ph::FILE_ARCHIVE,
-        "pdf" => ph::FILE_PDF,
-        "txt" | "md" | "log" | "csv" | "json" | "xml" | "yaml" | "yml" | "toml" | "ini" => {
-            ph::FILE_TEXT
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "tiff" | "heic" | "avif" => {
+            (ph::IMAGE, Tint::Image)
+        }
+        "mp4" | "mkv" | "mov" | "avi" | "webm" => (ph::FILM_STRIP, Tint::Media),
+        "mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac" => (ph::MUSIC_NOTE, Tint::Media),
+        "zip" | "xzip" | "xz" | "7z" | "rar" | "gz" | "tar" | "zst" | "bz2" => {
+            (ph::FILE_ARCHIVE, Tint::Archive)
+        }
+        "pdf" => (ph::FILE_PDF, Tint::Document),
+        "doc" | "docx" | "odt" | "rtf" => (ph::FILE_DOC, Tint::Document),
+        "xls" | "xlsx" | "ods" | "csv" => (ph::TABLE, Tint::Document),
+        "ppt" | "pptx" => (ph::PRESENTATION, Tint::Document),
+        "txt" | "md" | "log" | "json" | "xml" | "yaml" | "yml" | "toml" | "ini" => {
+            (ph::FILE_TEXT, Tint::Plain)
         }
         "rs" | "py" | "c" | "cpp" | "h" | "js" | "ts" | "go" | "java" | "cs" | "sh" | "rb"
-        | "html" | "css" => ph::FILE_CODE,
-        "exe" | "dll" | "so" | "dylib" | "bin" | "msi" | "app" => ph::GEAR_SIX,
-        "doc" | "docx" | "odt" | "rtf" => ph::FILE_DOC,
-        "xls" | "xlsx" | "ods" => ph::TABLE,
-        "ppt" | "pptx" => ph::PRESENTATION,
-        _ => ph::FILE,
+        | "html" | "css" | "php" | "swift" | "kt" => (ph::FILE_CODE, Tint::Code),
+        "exe" | "dll" | "so" | "dylib" | "bin" | "msi" | "app" | "o" | "a" => {
+            (ph::CPU, Tint::Binary)
+        }
+        _ => (ph::FILE, Tint::Plain),
+    }
+}
+
+fn tint_color(t: Tint, p: &Palette) -> Color32 {
+    match t {
+        Tint::Folder => p.warn,
+        Tint::Image => p.ok,
+        Tint::Media => Color32::from_rgb(244, 114, 182),
+        Tint::Archive => Color32::from_rgb(251, 146, 60),
+        Tint::Document => Color32::from_rgb(96, 165, 250),
+        Tint::Code => Color32::from_rgb(167, 139, 250),
+        Tint::Binary => p.accent,
+        Tint::Plain => p.text_dim,
     }
 }
 
@@ -209,26 +243,54 @@ fn open_in_file_manager(path: &Path) {
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
 
+fn shorten(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        s.to_string()
+    } else {
+        format!("…{}", s.chars().skip(n - max + 1).collect::<String>())
+    }
+}
+
+fn level_hint(level: u32) -> &'static str {
+    match level {
+        0 => "quickest, barely squeezes",
+        1 | 2 => "fast",
+        3..=5 => "balanced",
+        6 | 7 => "optimal parsing, patient",
+        8 => "big dictionary, slow",
+        _ => "smallest it can go",
+    }
+}
+
+/// Tiny glob: `*` any run, `?` one char; enough for excludes like *.log or node_modules.
+fn glob_match(pat: &str, text: &str) -> bool {
+    fn rec(p: &[char], t: &[char]) -> bool {
+        match (p.first(), t.first()) {
+            (None, None) => true,
+            (Some('*'), _) => rec(&p[1..], t) || (!t.is_empty() && rec(p, &t[1..])),
+            (Some('?'), Some(_)) => rec(&p[1..], &t[1..]),
+            (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => rec(&p[1..], &t[1..]),
+            _ => false,
+        }
+    }
+    let p: Vec<char> = pat.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    rec(&p, &t)
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut fonts = egui::FontDefinitions::default();
-        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-        cc.egui_ctx.set_fonts(fonts);
+        cc.egui_ctx.set_fonts(theme::fonts());
         let storage = cc.storage;
-        let dark = storage
-            .and_then(|s| s.get_string("dark"))
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        let level = storage
-            .and_then(|s| s.get_string("level"))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(6);
-        let threads = storage
-            .and_then(|s| s.get_string("threads"))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let recent = storage
-            .and_then(|s| s.get_string("recent"))
+        let get = |k: &str| storage.and_then(|s| s.get_string(k));
+        let dark = get("dark").map(|v| v != "0").unwrap_or(true);
+        let accent = Accent::from_name(&get("accent").unwrap_or_default());
+        let level = get("level").and_then(|v| v.parse().ok()).unwrap_or(6);
+        let threads = get("threads").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let filter_auto = get("filter_auto").map(|v| v != "0").unwrap_or(true);
+        let open_after = get("open_after").map(|v| v != "0").unwrap_or(true);
+        let recent = get("recent")
             .map(|v| {
                 v.split('\n')
                     .filter(|l| !l.is_empty())
@@ -236,9 +298,12 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
-        theme::apply(&cc.egui_ctx, dark);
+        let pal = theme::palette(dark, accent);
+        theme::apply(&cc.egui_ctx, &pal);
         let mut app = App {
             dark,
+            accent,
+            pal,
             archive: None,
             folder: String::new(),
             selection: HashSet::new(),
@@ -247,18 +312,18 @@ impl App {
             recent,
             level,
             threads,
+            filter_auto,
+            open_after,
             show_details: true,
             sort: (SortCol::Name, false),
             job: None,
             toasts: Vec::new(),
             dialog: Dialog::None,
-            status: "Open an archive, or drop files here to make one.".into(),
-            verified_label: String::new(),
-            fonts_ready: true,
+            status: "Ready when you are.".into(),
             screenshot: None,
             frames: 0,
         };
-        // xzip-gui [archive] [--screenshot out.png]  (renders one frame to a file and exits)
+        // xzip-gui [archive] [--screenshot out.png]  (renders a frame to a file and exits)
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
         while i < args.len() {
@@ -273,37 +338,19 @@ impl App {
         app
     }
 
-    fn screenshot_step(&mut self, ctx: &egui::Context) {
-        let Some(path) = self.screenshot.clone() else {
-            return;
-        };
-        self.frames += 1;
-        if self.frames == 40 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
-        }
-        let shot = ctx.input(|i| {
-            i.events.iter().find_map(|e| match e {
-                egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                _ => None,
-            })
-        });
-        if let Some(img) = shot {
-            let (w, h) = (img.size[0] as u32, img.size[1] as u32);
-            let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
-            if let Some(buf) = image::RgbaImage::from_raw(w, h, bytes) {
-                let _ = buf.save(&path);
-            }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        ctx.request_repaint();
-    }
-
     fn settings(&self) -> Settings {
-        Settings::level(self.level)
+        let mut s = Settings::level(self.level);
+        s.filter = if self.filter_auto {
+            FilterMode::Auto
+        } else {
+            FilterMode::Fixed(Filter::None)
+        };
+        s
     }
 
-    fn pal(&self) -> &'static Palette {
-        theme::palette(self.dark)
+    fn retheme(&mut self, ctx: &egui::Context) {
+        self.pal = theme::palette(self.dark, self.accent);
+        theme::apply(ctx, &self.pal);
     }
 
     fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
@@ -327,7 +374,10 @@ impl App {
         F: FnOnce(&(dyn Fn(u64, u64, &str) -> bool + Sync)) -> JobResult + Send + 'static,
     {
         if self.job.is_some() {
-            self.toast(ToastKind::Warn, "Another operation is still running.");
+            self.toast(
+                ToastKind::Warn,
+                "One thing at a time: something is still running.",
+            );
             return;
         }
         let progress = Arc::new(Mutex::new((0u64, 0u64, String::new())));
@@ -346,8 +396,7 @@ impl App {
                 }
                 !c2.load(Ordering::Relaxed)
             };
-            let result = work(&report);
-            let _ = tx.send(result);
+            let _ = tx.send(work(&report));
         });
         self.job = Some(Job {
             name,
@@ -356,12 +405,12 @@ impl App {
             rx,
             started: Instant::now(),
         });
-        self.status = format!("{name}...");
+        self.status = format!("{name}…");
     }
 
     fn poll_job(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.job else { return };
-        ctx.request_repaint_after(Duration::from_millis(80));
+        ctx.request_repaint_after(Duration::from_millis(60));
         let result = match job.rx.try_recv() {
             Ok(r) => r,
             Err(_) => return,
@@ -371,18 +420,12 @@ impl App {
         match result {
             JobResult::Opened(a) => {
                 let files = a.entries.iter().filter(|e| !e.is_dir()).count();
-                self.verified_label = format!("{}…", &hex(&a.archive_hash)[..12]);
-                self.status = format!(
-                    "Verified: {files} files, {} folders, {} on disk.",
-                    a.entries.len() - files,
-                    format_size(a.size())
-                );
+                self.status = format!("Verified. {files} files, {} folders, {} on disk. Nothing has changed since it was written.", a.entries.len() - files, format_size(a.size()));
                 let path = a.path.clone();
                 self.archive = Some(Arc::new(*a));
                 self.folder.clear();
                 self.selection.clear();
                 if self.screenshot.is_some() {
-                    // show something worth looking at: the first folder, first file selected
                     if let Some(a) = &self.archive {
                         if let Some(d) = a.entries.iter().find(|e| e.is_dir()) {
                             self.folder = d.path.clone();
@@ -401,7 +444,7 @@ impl App {
                 self.toast(
                     ToastKind::Ok,
                     format!(
-                        "Opened {} ({secs:.1}s)",
+                        "Opened {} in {secs:.1}s",
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ),
                 );
@@ -410,15 +453,15 @@ impl App {
                 if !skipped.is_empty() {
                     self.dialog = Dialog::Skipped(skipped);
                 }
-                self.toast(ToastKind::Ok, format!("Archive written in {secs:.1}s"));
+                self.toast(ToastKind::Ok, format!("Written and sealed in {secs:.1}s."));
                 self.open_path(path);
             }
-            JobResult::Extracted(report, dest) => {
+            JobResult::Extracted(report, _dest) => {
                 let msg = if report.skipped.is_empty() {
-                    format!("Extracted {} entries in {secs:.1}s", report.written.len())
+                    format!("Extracted {} entries in {secs:.1}s.", report.written.len())
                 } else {
                     format!(
-                        "Extracted {} entries; {} existing files kept",
+                        "Extracted {} entries; left {} existing files alone.",
                         report.written.len(),
                         report.skipped.len()
                     )
@@ -432,15 +475,12 @@ impl App {
                     },
                     msg,
                 );
-                let _ = dest;
             }
             JobResult::Verified(n) => {
-                self.status = format!("All {n} files verified in {secs:.1}s.");
+                self.status = format!("All {n} files check out ({secs:.1}s).");
                 self.toast(
                     ToastKind::Ok,
-                    format!(
-                        "All {n} files verified: every stream and every file's contents match."
-                    ),
+                    format!("All {n} files check out: every stream, every size, every hash."),
                 );
             }
             JobResult::Viewed(name, data) => {
@@ -476,9 +516,9 @@ impl App {
             }
             JobResult::Failed(msg, integrity) => {
                 self.status = if integrity {
-                    "Refused: integrity check failed.".into()
+                    "Refused: it did not pass verification. Nothing was read from it.".into()
                 } else {
-                    "Failed.".into()
+                    "That did not work.".into()
                 };
                 self.toast(ToastKind::Error, msg);
             }
@@ -486,8 +526,8 @@ impl App {
     }
 
     fn open_path(&mut self, path: PathBuf) {
-        self.start_job("Opening", move |report| {
-            report(0, 1, "verifying");
+        self.start_job("Verifying", move |report| {
+            report(0, 1, "hashing the whole file first");
             match archive::open_archive(&path) {
                 Ok(a) => JobResult::Opened(Box::new(a)),
                 Err(e) => JobResult::Failed(e.to_string(), e.is_integrity()),
@@ -496,7 +536,12 @@ impl App {
     }
 
     fn start_compress(&mut self, d: CompressDialog) {
-        let settings = Settings::level(d.level);
+        let mut settings = Settings::level(d.level);
+        settings.filter = if self.filter_auto {
+            FilterMode::Auto
+        } else {
+            FilterMode::Fixed(Filter::None)
+        };
         let existing = if d.adding_to_existing {
             self.archive.clone()
         } else {
@@ -564,6 +609,7 @@ impl App {
         };
         let dest = d.destination.clone();
         let open_after = d.open_after;
+        self.open_after = open_after;
         self.start_job("Extracting", move |report| {
             let sel: Option<Vec<&Entry>> = selected.as_ref().map(|paths| {
                 a.entries
@@ -587,7 +633,7 @@ impl App {
         let Some(a) = self.archive.clone() else {
             return;
         };
-        self.start_job("Verifying", move |report| match a.verify(Some(report)) {
+        self.start_job("Testing", move |report| match a.verify(Some(report)) {
             Ok(n) => JobResult::Verified(n),
             Err(e) => JobResult::Failed(e.to_string(), e.is_integrity()),
         });
@@ -603,7 +649,7 @@ impl App {
             };
             if e.size > 16 << 20 {
                 return JobResult::Failed(
-                    "File is larger than 16 MiB; extract it instead.".into(),
+                    "That one is over 16 MiB; extract it instead of viewing.".into(),
                     false,
                 );
             }
@@ -619,7 +665,7 @@ impl App {
             return;
         };
         let settings = self.settings();
-        self.start_job("Deleting", move |report| {
+        self.start_job("Rewriting", move |report| {
             let remove: HashSet<&str> = paths.iter().map(String::as_str).collect();
             let keep: Vec<&Entry> = a
                 .entries
@@ -667,13 +713,12 @@ impl App {
         let q = self.search.trim().to_lowercase();
         let mut rows: Vec<Row> = Vec::new();
         for e in &a.entries {
-            let in_folder = e.parent() == self.folder;
-            let matches_search = !q.is_empty() && e.path.to_lowercase().contains(&q);
-            if !(if q.is_empty() {
-                in_folder
+            let show = if q.is_empty() {
+                e.parent() == self.folder
             } else {
-                matches_search
-            }) {
+                e.path.to_lowercase().contains(&q)
+            };
+            if !show {
                 continue;
             }
             let (size, packed) = if e.is_dir() {
@@ -685,6 +730,7 @@ impl App {
             } else {
                 (e.size, e.data_length)
             };
+            let (icon, tint) = classify(e.name(), e.is_dir());
             rows.push(Row {
                 path: e.path.clone(),
                 name: if q.is_empty() {
@@ -696,7 +742,8 @@ impl App {
                 size,
                 packed,
                 mtime: e.mtime,
-                icon: icon_for(e.name(), e.is_dir()),
+                icon,
+                tint,
             });
         }
         let (col, rev) = self.sort;
@@ -716,7 +763,7 @@ impl App {
         rows
     }
 
-    // -- actions bound to buttons/keys ------------------------------------------------
+    // -- actions ----------------------------------------------------------------------
 
     fn action_open(&mut self) {
         if let Some(p) = rfd::FileDialog::new()
@@ -769,76 +816,186 @@ impl App {
             destination: default_dir,
             overwrite: false,
             selected_only: selected_only && !self.selection.is_empty(),
-            open_after: true,
+            open_after: self.open_after,
         });
     }
 
-    // -- UI ------------------------------------------------------------------------------
+    // -- widgets -------------------------------------------------------------------------
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let p = self.pal();
+    /// The brand tile: rounded accent square with the zipper glyph.
+    fn logo(&self, ui: &mut egui::Ui, size: f32) {
+        let p = &self.pal;
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+        let painter = ui.painter();
+        let r = size * 0.26;
+        painter.rect_filled(rect, r, p.accent);
+        painter.rect_filled(rect, r, theme::with_alpha(p.accent2, 70));
+        let band = Rect::from_min_max(rect.left_top(), Pos2::new(rect.right(), rect.center().y));
+        theme::gradient_rect_h(
+            painter,
+            band.shrink(2.0),
+            theme::with_alpha(Color32::WHITE, 34),
+            theme::with_alpha(Color32::WHITE, 4),
+        );
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            ph::FILE_ARCHIVE,
+            FontId::new(size * 0.58, egui::FontFamily::Proportional),
+            Color32::WHITE,
+        );
+    }
+
+    fn primary_button(&self, ui: &mut egui::Ui, text: &str, enabled: bool) -> bool {
+        let p = &self.pal;
+        let btn = egui::Button::new(
+            RichText::new(text)
+                .color(if p.dark {
+                    Color32::from_rgb(10, 12, 18)
+                } else {
+                    Color32::WHITE
+                })
+                .family(theme::semibold()),
+        )
+        .fill(p.accent)
+        .stroke(Stroke::NONE)
+        .corner_radius(9)
+        .min_size(Vec2::new(0.0, 34.0));
+        ui.add_enabled(enabled, btn).clicked()
+    }
+
+    fn tool_button(
+        &self,
+        ui: &mut egui::Ui,
+        icon: &str,
+        text: &str,
+        enabled: bool,
+        tip: &str,
+    ) -> bool {
+        let btn = egui::Button::new(format!("{icon}  {text}"))
+            .frame(false)
+            .min_size(Vec2::new(0.0, 34.0));
+        let resp = ui.add_enabled(enabled, btn);
+        let resp = if tip.is_empty() {
+            resp
+        } else {
+            resp.on_hover_text(tip)
+        };
+        resp.clicked()
+    }
+
+    fn header(&mut self, ui: &mut egui::Ui) {
         let busy = self.job.is_some();
         let has = self.archive.is_some();
         let sel = !self.selection.is_empty();
         ui.horizontal(|ui| {
             ui.add_space(4.0);
-            ui.label(RichText::new(ph::FILE_ARCHIVE).size(26.0).color(p.accent));
-            ui.label(RichText::new("xZip").size(20.0).strong());
-            ui.add_space(14.0);
-            let btn = |ui: &mut egui::Ui, icon: &str, text: &str, enabled: bool| -> bool {
-                ui.add_enabled(
-                    enabled,
-                    egui::Button::new(format!("{icon}  {text}")).min_size(Vec2::new(0.0, 32.0)),
-                )
-                .clicked()
-            };
-            if btn(ui, ph::PLUS_CIRCLE, "New", !busy) {
+            self.logo(ui, 30.0);
+            ui.add_space(4.0);
+            ui.vertical(|ui| {
+                ui.add_space(1.0);
+                ui.label(RichText::new("xZip").size(18.0).family(theme::semibold()));
+                ui.label(RichText::new("ARCHIVER").size(8.5).color(self.pal.text_dim));
+            });
+            ui.add_space(18.0);
+            if self.tool_button(
+                ui,
+                ph::PLUS_CIRCLE,
+                "New",
+                !busy,
+                "Create an archive (Ctrl+N)",
+            ) {
                 if let Some(files) = rfd::FileDialog::new().pick_files() {
                     self.action_new(files);
                 }
             }
-            if btn(ui, ph::FOLDER_OPEN, "Open", !busy) {
+            if self.tool_button(
+                ui,
+                ph::FOLDER_OPEN,
+                "Open",
+                !busy,
+                "Open an archive (Ctrl+O)",
+            ) {
                 self.action_open();
             }
             ui.separator();
-            if btn(ui, ph::FILE_PLUS, "Add files", !busy) {
+            if self.tool_button(
+                ui,
+                ph::FILE_PLUS,
+                "Add files",
+                !busy,
+                "Add files to this archive",
+            ) {
                 if let Some(files) = rfd::FileDialog::new().pick_files() {
                     self.action_add(files);
                 }
             }
-            if btn(ui, ph::FOLDER_PLUS, "Add folder", !busy) {
+            if self.tool_button(
+                ui,
+                ph::FOLDER_PLUS,
+                "Add folder",
+                !busy,
+                "Add a folder, recursively",
+            ) {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     self.action_add(vec![dir]);
                 }
             }
             ui.separator();
-            if btn(ui, ph::EXPORT, "Extract", !busy && has) {
-                self.action_extract(sel);
-            }
-            if btn(ui, ph::SHIELD_CHECK, "Test", !busy && has) {
+            if self.tool_button(
+                ui,
+                ph::SHIELD_CHECK,
+                "Test",
+                !busy && has,
+                "Decode every file and check every hash",
+            ) {
                 self.start_verify();
             }
-            if btn(ui, ph::TRASH, "Delete", !busy && has && sel) {
+            if self.tool_button(
+                ui,
+                ph::TRASH,
+                "Delete",
+                !busy && has && sel,
+                "Remove the selection (Delete)",
+            ) {
                 self.dialog = Dialog::ConfirmDelete(self.selected_paths(true));
             }
+            ui.add_space(6.0);
+            if self.primary_button(
+                ui,
+                &format!(
+                    "{}  {}",
+                    ph::EXPORT,
+                    if sel { "Extract selection" } else { "Extract" }
+                ),
+                !busy && has,
+            ) {
+                self.action_extract(sel);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let p = self.pal;
                 if ui
-                    .add(egui::Button::new(if self.dark { ph::SUN } else { ph::MOON }).frame(false))
-                    .on_hover_text("Theme")
+                    .add(
+                        egui::Button::new(
+                            RichText::new(if self.dark { ph::SUN } else { ph::MOON }).size(17.0),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text("Switch theme")
                     .clicked()
                 {
                     self.dark = !self.dark;
-                    theme::apply(ui.ctx(), self.dark);
+                    self.retheme(ui.ctx());
                 }
                 if ui
-                    .add(egui::Button::new(ph::GEAR).frame(false))
+                    .add(egui::Button::new(RichText::new(ph::GEAR_SIX).size(17.0)).frame(false))
                     .on_hover_text("Settings")
                     .clicked()
                 {
                     self.dialog = Dialog::Settings;
                 }
                 if ui
-                    .add(egui::Button::new(ph::INFO).frame(false))
+                    .add(egui::Button::new(RichText::new(ph::INFO).size(17.0)).frame(false))
                     .on_hover_text("About")
                     .clicked()
                 {
@@ -846,11 +1003,14 @@ impl App {
                 }
                 if ui
                     .add(
-                        egui::Button::new(if self.show_details {
-                            ph::SIDEBAR_SIMPLE
-                        } else {
-                            ph::SIDEBAR
-                        })
+                        egui::Button::new(
+                            RichText::new(if self.show_details {
+                                ph::SIDEBAR_SIMPLE
+                            } else {
+                                ph::SIDEBAR
+                            })
+                            .size(17.0),
+                        )
                         .frame(false),
                     )
                     .on_hover_text("Details panel")
@@ -858,91 +1018,167 @@ impl App {
                 {
                     self.show_details = !self.show_details;
                 }
-                let search = egui::TextEdit::singleline(&mut self.search)
-                    .hint_text(format!("{}  Search", ph::MAGNIFYING_GLASS))
-                    .desired_width(220.0);
-                ui.add(search);
+                ui.add_space(6.0);
+                egui::Frame::new()
+                    .fill(p.bg)
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin::symmetric(10, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(ph::MAGNIFYING_GLASS).color(p.text_dim));
+                            let edit = egui::TextEdit::singleline(&mut self.search)
+                                .id(Id::new("search"))
+                                .hint_text("Search this archive")
+                                .desired_width(210.0)
+                                .frame(egui::Frame::new());
+                            ui.add(edit);
+                            if !self.search.is_empty()
+                                && ui.add(egui::Button::new(ph::X).frame(false)).clicked()
+                            {
+                                self.search.clear();
+                            }
+                        });
+                    });
             });
         });
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let p = self.pal();
-        ui.add_space(6.0);
+        let p = self.pal;
+        ui.add_space(4.0);
         ui.label(RichText::new("ARCHIVE").small().color(p.text_dim));
-        match &self.archive {
+        ui.add_space(2.0);
+        match self.archive.clone() {
             Some(a) => {
                 let files = a.entries.iter().filter(|e| !e.is_dir()).count();
                 let size: u64 = a.entries.iter().map(|e| e.size).sum();
+                let ratio = if size > 0 {
+                    a.size() as f32 / size as f32
+                } else {
+                    1.0
+                };
                 egui::Frame::new()
                     .fill(p.card)
-                    .corner_radius(10)
-                    .inner_margin(12)
+                    .corner_radius(12)
+                    .inner_margin(14)
+                    .stroke(Stroke::new(1.0, p.border))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(ph::FILE_ARCHIVE).size(22.0).color(p.accent));
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new(
-                                        a.path.file_name().unwrap_or_default().to_string_lossy(),
-                                    )
-                                    .strong(),
-                                );
-                                ui.label(
-                                    RichText::new(format!("{} on disk", format_size(a.size())))
-                                        .small()
-                                        .color(p.text_dim),
-                                );
-                            });
+                        ui.set_width(ui.available_width());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(
+                                    a.path.file_name().unwrap_or_default().to_string_lossy(),
+                                )
+                                .family(theme::semibold())
+                                .size(15.0),
+                            )
+                            .truncate(),
+                        );
+                        ui.add_space(8.0);
+                        ui.vertical_centered(|ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(76.0), Sense::hover());
+                            let painter = ui.painter();
+                            theme::ring(
+                                painter,
+                                rect.center(),
+                                32.0,
+                                7.0,
+                                1.0 - ratio.clamp(0.0, 1.0),
+                                p.accent,
+                                p.border,
+                            );
+                            painter.text(
+                                rect.center(),
+                                Align2::CENTER_CENTER,
+                                format!("{:.0}%", ratio * 100.0),
+                                FontId::new(15.0, theme::semibold()),
+                                p.text,
+                            );
+                            ui.label(
+                                RichText::new("of the original size")
+                                    .small()
+                                    .color(p.text_dim),
+                            );
                         });
-                        ui.add_space(6.0);
-                        ui.label(format!(
-                            "{files} files · {} folders",
-                            a.entries.len() - files
-                        ));
-                        ui.label(format!("{} uncompressed", format_size(size)));
-                        if size > 0 {
-                            ui.label(format!(
-                                "{:.1}% of original",
-                                a.size() as f64 / size as f64 * 100.0
-                            ));
-                        }
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(ph::SHIELD_CHECK).color(p.ok).size(16.0));
-                            ui.label(RichText::new("Verified").color(p.ok).strong());
-                        });
-                        ui.label(
-                            RichText::new(format!("SHA-256 {}", self.verified_label))
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "{} on disk · {} inside",
+                                    format_size(a.size()),
+                                    format_size(size)
+                                ))
                                 .small()
                                 .color(p.text_dim),
-                        )
-                        .on_hover_text(hex(&a.archive_hash));
+                            )
+                            .truncate(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "{files} files · {} folders",
+                                    a.entries.len() - files
+                                ))
+                                .small(),
+                            )
+                            .truncate(),
+                        );
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
+                            let painter = ui.painter();
+                            theme::glow(painter, rect.center(), 18.0, p.ok);
+                            painter.circle_filled(rect.center(), 11.0, theme::with_alpha(p.ok, 40));
+                            painter.text(
+                                rect.center(),
+                                Align2::CENTER_CENTER,
+                                ph::SHIELD_CHECK,
+                                FontId::proportional(16.0),
+                                p.ok,
+                            );
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new("Verified")
+                                        .color(p.ok)
+                                        .family(theme::semibold()),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!(
+                                            "SHA-256 {}…",
+                                            &hex(&a.archive_hash)[..12]
+                                        ))
+                                        .small()
+                                        .color(p.text_dim),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(hex(&a.archive_hash));
+                            });
+                        });
                     });
             }
             None => {
-                egui::Frame::new()
-                    .fill(p.card)
-                    .corner_radius(10)
-                    .inner_margin(12)
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("No archive open").color(p.text_dim));
-                        ui.label(
-                            RichText::new(
-                                "Drop files or folders anywhere in this window to create one.",
-                            )
-                            .small()
-                            .color(p.text_dim),
-                        );
-                    });
+                egui::Frame::new().fill(p.card).corner_radius(12).inner_margin(14).stroke(Stroke::new(1.0, p.border)).show(ui, |ui| {
+                    ui.label(RichText::new("Nothing open").family(theme::semibold()));
+                    ui.label(RichText::new("Drop files or folders anywhere in this window and I'll make an archive out of them.").small().color(p.text_dim));
+                });
             }
         }
-        ui.add_space(14.0);
+        ui.add_space(16.0);
         ui.label(RichText::new("RECENT").small().color(p.text_dim));
+        ui.add_space(2.0);
         let recent = self.recent.clone();
         let mut open: Option<PathBuf> = None;
+        let mut forget: Option<PathBuf> = None;
         if recent.is_empty() {
-            ui.label(RichText::new("Nothing yet").small().color(p.text_dim));
+            ui.label(
+                RichText::new("Archives you open will show up here.")
+                    .small()
+                    .color(p.text_dim),
+            );
         }
         for r in recent {
             let name = r
@@ -950,22 +1186,32 @@ impl App {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let resp = ui.add(
-                egui::Button::new(format!("{}  {name}", ph::CLOCK_COUNTER_CLOCKWISE))
-                    .frame(false)
-                    .truncate(),
-            );
+            let exists = r.exists();
+            let label = RichText::new(format!("{}  {name}", ph::CLOCK_COUNTER_CLOCKWISE))
+                .color(if exists { p.text } else { p.text_dim });
+            let resp = ui.add(egui::Button::new(label).frame(false).truncate());
             if resp.on_hover_text(r.display().to_string()).clicked() && self.job.is_none() {
-                open = Some(r.clone());
+                if exists {
+                    open = Some(r.clone());
+                } else {
+                    forget = Some(r.clone());
+                }
             }
         }
         if let Some(r) = open {
             self.open_path(r);
         }
+        if let Some(r) = forget {
+            self.recent.retain(|x| x != &r);
+            self.toast(
+                ToastKind::Warn,
+                "That file is gone; removed it from the list.",
+            );
+        }
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
             ui.add_space(4.0);
             if ui
-                .add(egui::Button::new(format!("{}  Security notes", ph::SHIELD)).frame(false))
+                .add(egui::Button::new(format!("{}  What gets checked", ph::SHIELD)).frame(false))
                 .clicked()
             {
                 self.dialog = Dialog::Security;
@@ -974,11 +1220,14 @@ impl App {
     }
 
     fn breadcrumb(&mut self, ui: &mut egui::Ui) {
-        let p = self.pal();
+        let p = self.pal;
         ui.horizontal(|ui| {
             let can_up = !self.folder.is_empty() && self.search.is_empty();
             if ui
-                .add_enabled(can_up, egui::Button::new(ph::ARROW_UP))
+                .add_enabled(
+                    can_up,
+                    egui::Button::new(ph::ARROW_UP).min_size(Vec2::new(32.0, 30.0)),
+                )
                 .on_hover_text("Up (Backspace)")
                 .clicked()
             {
@@ -995,21 +1244,36 @@ impl App {
                         .to_string()
                 })
                 .unwrap_or_default();
-            if ui
-                .add(egui::Button::new(RichText::new(name).strong()).frame(false))
+            let chip = |ui: &mut egui::Ui, text: &str, current: bool| -> bool {
+                let rt = RichText::new(text).family(if current {
+                    theme::semibold()
+                } else {
+                    egui::FontFamily::Proportional
+                });
+                ui.add(
+                    egui::Button::new(rt)
+                        .fill(if current {
+                            p.accent_soft
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .stroke(Stroke::NONE)
+                        .corner_radius(8),
+                )
                 .clicked()
-            {
-                self.folder.clear();
-            }
+            };
             let parts: Vec<String> = if self.folder.is_empty() {
                 vec![]
             } else {
                 self.folder.split('/').map(String::from).collect()
             };
+            if chip(ui, &name, parts.is_empty()) {
+                self.folder.clear();
+            }
             let mut goto: Option<String> = None;
             for (i, part) in parts.iter().enumerate() {
                 ui.label(RichText::new(ph::CARET_RIGHT).color(p.text_dim));
-                if ui.add(egui::Button::new(part).frame(false)).clicked() {
+                if chip(ui, part, i + 1 == parts.len()) {
                     goto = Some(parts[..=i].join("/"));
                 }
             }
@@ -1017,10 +1281,7 @@ impl App {
                 self.folder = g;
             }
             if !self.search.is_empty() {
-                ui.label(
-                    RichText::new(format!("  search results for \"{}\"", self.search))
-                        .color(p.text_dim),
-                );
+                ui.label(RichText::new(format!("results for “{}”", self.search)).color(p.text_dim));
             }
         });
     }
@@ -1034,11 +1295,27 @@ impl App {
     }
 
     fn table(&mut self, ui: &mut egui::Ui) {
-        let p = self.pal();
+        let p = self.pal;
         let rows = self.rows();
+        let max_size = rows.iter().map(|r| r.size).max().unwrap_or(0).max(1) as f32;
+        if rows.is_empty() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(ph::GHOST).size(40.0).color(p.text_dim));
+                ui.label(
+                    RichText::new(if self.search.is_empty() {
+                        "Nothing in here."
+                    } else {
+                        "No matches."
+                    })
+                    .color(p.text_dim),
+                );
+            });
+            return;
+        }
         let mut enter: Option<String> = None;
         let mut view: Option<String> = None;
-        let mut toggle: Option<(String, bool, bool)> = None; // path, ctrl, shift
+        let mut toggle: Option<(String, bool, bool)> = None;
         let mut extract_ctx: Option<String> = None;
         let mut delete_ctx: Option<String> = None;
         let mut sort_click: Option<SortCol> = None;
@@ -1057,13 +1334,10 @@ impl App {
             } else {
                 ""
             };
-            if ui
-                .add(
-                    egui::Button::new(RichText::new(format!("{label} {arrow}")).strong())
-                        .frame(false),
-                )
-                .clicked()
-            {
+            let text = RichText::new(format!("{label} {arrow}"))
+                .small()
+                .color(p.text_dim);
+            if ui.add(egui::Button::new(text).frame(false)).clicked() {
                 *out = Some(col);
             }
         };
@@ -1073,22 +1347,22 @@ impl App {
             .sense(Sense::click())
             .cell_layout(Layout::left_to_right(Align::Center))
             .column(Column::remainder().at_least(160.0).clip(true))
+            .column(Column::initial(120.0).at_least(80.0))
             .column(Column::initial(90.0).at_least(60.0))
-            .column(Column::initial(90.0).at_least(60.0))
-            .column(Column::initial(70.0).at_least(50.0))
+            .column(Column::initial(60.0).at_least(50.0))
             .column(Column::initial(120.0).at_least(90.0))
             .min_scrolled_height(height - 10.0)
-            .header(28.0, |mut h| {
-                h.col(|ui| header_col(ui, "Name", SortCol::Name, self.sort, &mut sort_click));
-                h.col(|ui| header_col(ui, "Size", SortCol::Size, self.sort, &mut sort_click));
-                h.col(|ui| header_col(ui, "Packed", SortCol::Packed, self.sort, &mut sort_click));
+            .header(26.0, |mut h| {
+                h.col(|ui| header_col(ui, "NAME", SortCol::Name, self.sort, &mut sort_click));
+                h.col(|ui| header_col(ui, "SIZE", SortCol::Size, self.sort, &mut sort_click));
+                h.col(|ui| header_col(ui, "PACKED", SortCol::Packed, self.sort, &mut sort_click));
                 h.col(|ui| {
-                    ui.label(RichText::new("Ratio").strong());
+                    ui.label(RichText::new("RATIO").small().color(p.text_dim));
                 });
                 h.col(|ui| {
                     header_col(
                         ui,
-                        "Modified",
+                        "MODIFIED",
                         SortCol::Modified,
                         self.sort,
                         &mut sort_click,
@@ -1096,21 +1370,46 @@ impl App {
                 });
             })
             .body(|body| {
-                body.rows(26.0, rows.len(), |mut row| {
+                body.rows(30.0, rows.len(), |mut row| {
                     let r = &rows[row.index()];
                     row.set_selected(self.selection.contains(&r.path));
                     row.col(|ui| {
+                        ui.add_space(4.0);
                         ui.label(
                             RichText::new(r.icon)
-                                .color(if r.is_dir { p.warn } else { p.accent })
-                                .size(16.0),
+                                .color(tint_color(r.tint, &p))
+                                .size(17.0),
                         );
-                        ui.label(&r.name);
+                        ui.label(RichText::new(&r.name).color(p.text));
+                        if r.is_dir {
+                            ui.label(RichText::new(ph::CARET_RIGHT).small().color(p.text_dim));
+                        }
                     });
                     row.col(|ui| {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(format_size(r.size));
-                        });
+                        // the number, over a bar showing its share of the biggest item here
+                        let (rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 20.0),
+                            Sense::hover(),
+                        );
+                        let painter = ui.painter();
+                        let frac = (r.size as f32 / max_size).clamp(0.0, 1.0);
+                        let w = (rect.width() - 8.0) * frac;
+                        let bar = Rect::from_min_max(
+                            Pos2::new(rect.right() - 4.0 - w, rect.top() + 3.0),
+                            Pos2::new(rect.right() - 4.0, rect.bottom() - 3.0),
+                        );
+                        painter.rect_filled(
+                            bar,
+                            4.0,
+                            theme::with_alpha(p.accent, if p.dark { 34 } else { 46 }),
+                        );
+                        painter.text(
+                            Pos2::new(rect.right() - 8.0, rect.center().y),
+                            Align2::RIGHT_CENTER,
+                            format_size(r.size),
+                            FontId::proportional(14.0),
+                            p.text,
+                        );
                     });
                     row.col(|ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1138,8 +1437,9 @@ impl App {
                             view = Some(r.path.clone());
                         }
                     } else if resp.clicked() {
-                        let mods = ui_modifiers(&resp);
-                        toggle = Some((r.path.clone(), mods.0, mods.1));
+                        let (ctrl, shift) =
+                            resp.ctx.input(|i| (i.modifiers.command, i.modifiers.shift));
+                        toggle = Some((r.path.clone(), ctrl, shift));
                     }
                     resp.context_menu(|ui| {
                         if ui.button(format!("{}  Extract…", ph::EXPORT)).clicked() {
@@ -1224,30 +1524,50 @@ impl App {
     }
 
     fn details(&mut self, ui: &mut egui::Ui) {
-        let p = self.pal();
+        let p = self.pal;
         let Some(a) = self.archive.clone() else {
             return;
         };
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         ui.label(RichText::new("DETAILS").small().color(p.text_dim));
+        ui.add_space(2.0);
         let mut extract_one = false;
         let mut view_one: Option<String> = None;
         if self.selection.len() == 1 {
             let path = self.selection.iter().next().unwrap().clone();
             if let Some(e) = a.find(&path) {
+                let (icon, tint) = classify(e.name(), e.is_dir());
                 egui::Frame::new()
                     .fill(p.card)
-                    .corner_radius(10)
-                    .inner_margin(12)
+                    .corner_radius(12)
+                    .inner_margin(14)
+                    .stroke(Stroke::new(1.0, p.border))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(icon_for(e.name(), e.is_dir()))
-                                    .size(28.0)
-                                    .color(p.accent),
+                            let (rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
+                            let painter = ui.painter();
+                            painter.rect_filled(
+                                rect,
+                                10.0,
+                                theme::with_alpha(tint_color(tint, &p), 30),
+                            );
+                            painter.text(
+                                rect.center(),
+                                Align2::CENTER_CENTER,
+                                icon,
+                                FontId::proportional(24.0),
+                                tint_color(tint, &p),
                             );
                             ui.vertical(|ui| {
-                                ui.label(RichText::new(e.name()).strong());
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(e.name())
+                                            .family(theme::semibold())
+                                            .size(15.0),
+                                    )
+                                    .truncate(),
+                                );
                                 ui.label(
                                     RichText::new(kind_for(e.name(), e.is_dir()))
                                         .small()
@@ -1255,11 +1575,13 @@ impl App {
                                 );
                             });
                         });
-                        ui.add_space(8.0);
+                        ui.add_space(10.0);
                         let kv = |ui: &mut egui::Ui, k: &str, v: String| {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(k).color(p.text_dim));
-                                ui.add(egui::Label::new(v).truncate());
+                                ui.label(RichText::new(k).small().color(p.text_dim));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.add(egui::Label::new(RichText::new(v).small()).truncate());
+                                });
                             });
                         };
                         kv(ui, "Path", e.path.clone());
@@ -1267,13 +1589,13 @@ impl App {
                             kv(
                                 ui,
                                 "Size",
-                                format!("{} ({} bytes)", format_size(e.size), e.size),
+                                format!("{} · {} bytes", format_size(e.size), e.size),
                             );
                             kv(
                                 ui,
                                 "Packed",
                                 format!(
-                                    "{} ({:.1}%)",
+                                    "{} · {:.1}%",
                                     format_size(e.data_length),
                                     if e.size > 0 {
                                         e.data_length as f64 / e.size as f64 * 100.0
@@ -1288,22 +1610,41 @@ impl App {
                             kv(ui, "Mode", "executable".into());
                         }
                         if !e.is_dir() {
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new("SHA-256 of contents")
-                                    .small()
-                                    .color(p.text_dim),
-                            );
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(hex(&e.sha_data)).small().monospace(),
-                                )
-                                .wrap(),
-                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("SHA-256").small().color(p.text_dim));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(RichText::new(ph::COPY).small())
+                                                .frame(false),
+                                        )
+                                        .on_hover_text("Copy hash")
+                                        .clicked()
+                                    {
+                                        ui.ctx().copy_text(hex(&e.sha_data));
+                                    }
+                                });
+                            });
+                            egui::Frame::new()
+                                .fill(p.bg)
+                                .corner_radius(8)
+                                .inner_margin(8)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(hex(&e.sha_data))
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(p.text_dim),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
                         }
-                        ui.add_space(8.0);
+                        ui.add_space(10.0);
                         ui.horizontal(|ui| {
-                            if ui.button(format!("{} Extract", ph::EXPORT)).clicked() {
+                            if self.primary_button(ui, &format!("{} Extract", ph::EXPORT), true) {
                                 extract_one = true;
                             }
                             if !e.is_dir() && ui.button(format!("{} View", ph::EYE)).clicked() {
@@ -1317,26 +1658,34 @@ impl App {
             let size: u64 = paths.iter().filter_map(|p| a.find(p)).map(|e| e.size).sum();
             egui::Frame::new()
                 .fill(p.card)
-                .corner_radius(10)
-                .inner_margin(12)
+                .corner_radius(12)
+                .inner_margin(14)
+                .stroke(Stroke::new(1.0, p.border))
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new(format!("{} items selected", self.selection.len())).strong(),
+                        RichText::new(format!("{} items selected", self.selection.len()))
+                            .family(theme::semibold()),
                     );
-                    ui.label(format!("{} in {} entries", format_size(size), paths.len()));
-                    if ui
-                        .button(format!("{} Extract selection", ph::EXPORT))
-                        .clicked()
-                    {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} across {} entries",
+                            format_size(size),
+                            paths.len()
+                        ))
+                        .small()
+                        .color(p.text_dim),
+                    );
+                    ui.add_space(8.0);
+                    if self.primary_button(ui, &format!("{} Extract selection", ph::EXPORT), true) {
                         extract_one = true;
                     }
                 });
         } else {
-            ui.label(
-                RichText::new("Select a file to see its details.")
-                    .small()
-                    .color(p.text_dim),
-            );
+            egui::Frame::new().fill(p.card).corner_radius(12).inner_margin(14).stroke(Stroke::new(1.0, p.border)).show(ui, |ui| {
+                ui.label(RichText::new("Pick a file to see what's inside it.").small().color(p.text_dim));
+                ui.add_space(6.0);
+                ui.label(RichText::new("Double-click opens folders and previews files. Ctrl-click and Shift-click select more.").small().color(p.text_dim));
+            });
         }
         if extract_one {
             self.action_extract(true);
@@ -1347,13 +1696,13 @@ impl App {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        let p = self.pal();
+        let p = self.pal;
         ui.horizontal(|ui| {
             if let Some(job) = &self.job {
                 let (done, total, path) =
                     job.progress.lock().map(|g| g.clone()).unwrap_or_default();
                 let frac = if total > 0 {
-                    done as f32 / total as f32
+                    (done as f32 / total as f32).clamp(0.0, 1.0)
                 } else {
                     0.0
                 };
@@ -1369,77 +1718,227 @@ impl App {
                     String::new()
                 };
                 ui.label(
-                    RichText::new(format!("{} {}", job.name, shorten(&path, 40))).color(p.text_dim),
+                    RichText::new(format!("{} {}", job.name, shorten(&path, 36))).color(p.text_dim),
                 );
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .desired_width(260.0)
-                        .show_percentage(),
-                );
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(260.0, 10.0), Sense::hover());
+                let painter = ui.painter();
+                painter.rect_filled(rect, 5.0, p.border);
+                if frac > 0.0 {
+                    let filled = Rect::from_min_size(
+                        rect.min,
+                        Vec2::new(rect.width() * frac, rect.height()),
+                    );
+                    theme::gradient_rect_h(painter, filled, p.accent, p.accent2);
+                }
                 ui.label(
-                    RichText::new(format!("{}/s{eta}", format_size(rate as u64)))
-                        .small()
-                        .color(p.text_dim),
+                    RichText::new(format!(
+                        "{:.0}%  {}/s{eta}",
+                        frac * 100.0,
+                        format_size(rate as u64)
+                    ))
+                    .small()
+                    .color(p.text_dim),
                 );
-                if ui.button(format!("{} Cancel", ph::X)).clicked() {
+                if ui
+                    .add(egui::Button::new(format!("{} Cancel", ph::X)).frame(false))
+                    .clicked()
+                {
                     job.cancel.store(true, Ordering::Relaxed);
                 }
             } else {
                 ui.label(RichText::new(&self.status).color(p.text_dim));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "Level {} · {}",
-                        self.level,
-                        if self.threads == 0 {
-                            "all cores".to_string()
-                        } else {
-                            format!("{} threads", self.threads)
-                        }
-                    ))
-                    .small()
-                    .color(p.text_dim),
+                let chip = format!(
+                    "Level {} · {} · filter {}",
+                    self.level,
+                    if self.threads == 0 {
+                        "all cores".to_string()
+                    } else {
+                        format!("{} threads", self.threads)
+                    },
+                    if self.filter_auto { "auto" } else { "off" }
                 );
+                egui::Frame::new()
+                    .fill(p.card)
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(8, 3))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(chip).small().color(p.text_dim));
+                    });
             });
         });
     }
 
+    fn hero(&mut self, ui: &mut egui::Ui) {
+        let p = self.pal;
+        let full = ui.available_rect_before_wrap();
+        theme::gradient_rect(ui.painter(), full, p.bg, p.bg2);
+        theme::glow(
+            ui.painter(),
+            Pos2::new(full.center().x, full.top() + full.height() * 0.3),
+            full.width().min(full.height()) * 0.45,
+            p.accent,
+        );
+        let mut open = false;
+        let mut new_files = false;
+        let mut recent_open: Option<PathBuf> = None;
+        ui.vertical_centered(|ui| {
+            ui.add_space(full.height() * 0.14);
+            self.logo(ui, 72.0);
+            ui.add_space(14.0);
+            ui.label(RichText::new("Your files, sealed and verified.").size(30.0).family(theme::semibold()));
+            ui.add_space(4.0);
+            ui.label(RichText::new("Drop anything on this window to archive it. Open an .xzip and it is checked, byte for byte, before you see a single file.").size(14.5).color(p.text_dim));
+            ui.add_space(26.0);
+            ui.horizontal(|ui| {
+                let total = 2.0 * 230.0 + 12.0;
+                ui.add_space((ui.available_width() - total).max(0.0) / 2.0);
+                if self.hero_card(ui, ph::FOLDER_OPEN, "Open an archive", "Browse, extract, test. Ctrl+O", p.accent) {
+                    open = true;
+                }
+                ui.add_space(12.0);
+                if self.hero_card(ui, ph::PLUS_CIRCLE, "Make a new one", "Pick files, choose a level. Ctrl+N", p.accent2) {
+                    new_files = true;
+                }
+            });
+            if !self.recent.is_empty() {
+                ui.add_space(28.0);
+                ui.label(RichText::new("RECENT").small().color(p.text_dim));
+                ui.add_space(4.0);
+                let layout = Layout::left_to_right(Align::Center).with_main_align(Align::Center);
+                ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 40.0), layout, |ui| {
+                    for r in self.recent.clone() {
+                        let name = r.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        if ui.add(egui::Button::new(format!("{}  {name}", ph::FILE_ARCHIVE)).corner_radius(14)).on_hover_text(r.display().to_string()).clicked() {
+                            recent_open = Some(r.clone());
+                        }
+                    }
+                });
+            }
+        });
+        if open {
+            self.action_open();
+        }
+        if new_files {
+            if let Some(files) = rfd::FileDialog::new().pick_files() {
+                self.action_new(files);
+            }
+        }
+        if let Some(r) = recent_open {
+            self.open_path(r);
+        }
+    }
+
+    fn hero_card(
+        &self,
+        ui: &mut egui::Ui,
+        icon: &str,
+        title: &str,
+        sub: &str,
+        color: Color32,
+    ) -> bool {
+        let p = &self.pal;
+        let size = Vec2::new(230.0, 92.0);
+        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+        let hover = ui
+            .ctx()
+            .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+        let painter = ui.painter();
+        let rect = rect.translate(Vec2::new(0.0, -2.0 * hover));
+        painter.rect_filled(
+            rect.translate(Vec2::new(0.0, 4.0)),
+            14.0,
+            Color32::from_black_alpha((50.0 * hover) as u8),
+        );
+        painter.rect_filled(rect, 14.0, theme::mix(p.card, p.card_hover, hover));
+        painter.rect_stroke(
+            rect,
+            14.0,
+            Stroke::new(1.0, theme::mix(p.border, color, hover * 0.8)),
+            egui::StrokeKind::Inside,
+        );
+        let tile = Rect::from_min_size(rect.min + Vec2::new(16.0, 22.0), Vec2::splat(48.0));
+        painter.rect_filled(tile, 12.0, theme::with_alpha(color, 36));
+        painter.text(
+            tile.center(),
+            Align2::CENTER_CENTER,
+            icon,
+            FontId::proportional(26.0),
+            color,
+        );
+        painter.text(
+            rect.min + Vec2::new(78.0, 32.0),
+            Align2::LEFT_CENTER,
+            title,
+            FontId::new(15.0, theme::semibold()),
+            p.text,
+        );
+        painter.text(
+            rect.min + Vec2::new(78.0, 56.0),
+            Align2::LEFT_CENTER,
+            sub,
+            FontId::proportional(12.0),
+            p.text_dim,
+        );
+        resp.clicked()
+    }
+
     fn toasts(&mut self, ctx: &egui::Context) {
-        let p = self.pal();
+        let p = self.pal;
         self.toasts.retain(|t| {
-            t.born.elapsed() < Duration::from_secs(if t.kind == ToastKind::Error { 9 } else { 4 })
+            t.born.elapsed()
+                < Duration::from_millis(if t.kind == ToastKind::Error {
+                    9000
+                } else {
+                    4200
+                })
         });
         if self.toasts.is_empty() {
             return;
         }
-        ctx.request_repaint_after(Duration::from_millis(200));
+        ctx.request_repaint_after(Duration::from_millis(40));
         egui::Area::new(Id::new("toasts"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -44.0])
+            .anchor(Align2::RIGHT_BOTTOM, [-16.0, -46.0])
             .order(egui::Order::Foreground)
+            .interactable(false)
             .show(ctx, |ui| {
                 for t in &self.toasts {
+                    let age = t.born.elapsed().as_secs_f32();
+                    let life = if t.kind == ToastKind::Error { 9.0 } else { 4.2 };
+                    let a = (age / 0.18).min(1.0) * ((life - age) / 0.4).clamp(0.0, 1.0);
                     let (icon, color) = match t.kind {
                         ToastKind::Ok => (ph::CHECK_CIRCLE, p.ok),
                         ToastKind::Warn => (ph::WARNING, p.warn),
                         ToastKind::Error => (ph::X_CIRCLE, p.danger),
                     };
+                    let alpha = (a * 255.0) as u8;
                     egui::Frame::new()
-                        .fill(p.card)
-                        .stroke(egui::Stroke::new(1.0, color))
-                        .corner_radius(10)
+                        .fill(theme::with_alpha(p.card, alpha))
+                        .stroke(Stroke::new(1.0, theme::with_alpha(color, alpha)))
+                        .corner_radius(12)
                         .inner_margin(12)
                         .shadow(egui::epaint::Shadow {
-                            offset: [0, 4],
-                            blur: 16,
+                            offset: [0, 6],
+                            blur: 18,
                             spread: 0,
-                            color: Color32::from_black_alpha(90),
+                            color: Color32::from_black_alpha((110.0 * a) as u8),
                         })
                         .show(ui, |ui| {
                             ui.set_max_width(380.0);
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(icon).color(color).size(18.0));
-                                ui.add(egui::Label::new(&t.text).wrap());
+                                ui.label(
+                                    RichText::new(icon)
+                                        .color(theme::with_alpha(color, alpha))
+                                        .size(18.0),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&t.text)
+                                            .color(theme::with_alpha(p.text, alpha)),
+                                    )
+                                    .wrap(),
+                                );
                             });
                         });
                     ui.add_space(6.0);
@@ -1448,136 +1947,81 @@ impl App {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
-        let p = self.pal();
+        let p = self.pal;
         let dialog = std::mem::take(&mut self.dialog);
         let mut next = Dialog::None;
+        let close_btn = |ui: &mut egui::Ui| ui.button("Close").clicked();
         match dialog {
             Dialog::None => {}
             Dialog::Compress(mut d) => {
-                let mut action: Option<bool> = None; // Some(true) = go
+                let mut action: Option<bool> = None;
                 let m = egui::Modal::new(Id::new("compress")).show(ctx, |ui| {
-                    ui.set_width(560.0);
-                    ui.heading(if d.adding_to_existing {
-                        "Add to archive"
-                    } else {
-                        "New archive"
-                    });
+                    ui.set_width(580.0);
+                    ui.heading(if d.adding_to_existing { "Add to archive" } else { "New archive" });
                     ui.add_space(8.0);
-                    ui.label(RichText::new("Sources").small().color(p.text_dim));
-                    egui::Frame::new()
-                        .fill(p.bg)
-                        .corner_radius(8)
-                        .inner_margin(8)
-                        .show(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .max_height(140.0)
-                                .show(ui, |ui| {
-                                    let mut remove: Option<usize> = None;
-                                    for (i, s) in d.sources.iter().enumerate() {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(if s.is_dir() {
-                                                    ph::FOLDER
-                                                } else {
-                                                    ph::FILE
-                                                })
-                                                .color(p.accent),
-                                            );
-                                            ui.add(
-                                                egui::Label::new(s.display().to_string())
-                                                    .truncate(),
-                                            );
-                                            ui.with_layout(
-                                                Layout::right_to_left(Align::Center),
-                                                |ui| {
-                                                    if ui
-                                                        .add(egui::Button::new(ph::X).frame(false))
-                                                        .clicked()
-                                                    {
-                                                        remove = Some(i);
-                                                    }
-                                                },
-                                            );
-                                        });
-                                    }
-                                    if let Some(i) = remove {
-                                        d.sources.remove(i);
-                                    }
+                    ui.label(RichText::new("WHAT GOES IN").small().color(p.text_dim));
+                    egui::Frame::new().fill(p.bg).corner_radius(10).inner_margin(8).show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                            let mut remove: Option<usize> = None;
+                            if d.sources.is_empty() {
+                                ui.label(RichText::new("Nothing yet. Add files or a folder below, or drop them on the window.").small().color(p.text_dim));
+                            }
+                            for (i, s) in d.sources.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    let (icon, tint) = classify(&s.file_name().unwrap_or_default().to_string_lossy(), s.is_dir());
+                                    ui.label(RichText::new(icon).color(tint_color(tint, &p)));
+                                    ui.add(egui::Label::new(s.display().to_string()).truncate());
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.add(egui::Button::new(ph::X).frame(false)).clicked() {
+                                            remove = Some(i);
+                                        }
+                                    });
                                 });
+                            }
+                            if let Some(i) = remove {
+                                d.sources.remove(i);
+                            }
                         });
+                    });
                     ui.horizontal(|ui| {
                         if ui.button(format!("{} Add files", ph::FILE_PLUS)).clicked() {
                             if let Some(f) = rfd::FileDialog::new().pick_files() {
                                 d.sources.extend(f);
                             }
                         }
-                        if ui
-                            .button(format!("{} Add folder", ph::FOLDER_PLUS))
-                            .clicked()
-                        {
+                        if ui.button(format!("{} Add folder", ph::FOLDER_PLUS)).clicked() {
                             if let Some(f) = rfd::FileDialog::new().pick_folder() {
                                 d.sources.push(f);
                             }
                         }
                     });
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("Archive").small().color(p.text_dim));
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("ARCHIVE FILE").small().color(p.text_dim));
                     ui.horizontal(|ui| {
                         let mut dest = d.destination.display().to_string();
-                        if ui
-                            .add_enabled(
-                                !d.adding_to_existing,
-                                egui::TextEdit::singleline(&mut dest).desired_width(430.0),
-                            )
-                            .changed()
-                        {
+                        if ui.add_enabled(!d.adding_to_existing, egui::TextEdit::singleline(&mut dest).desired_width(450.0)).changed() {
                             d.destination = PathBuf::from(dest);
                         }
-                        if ui
-                            .add_enabled(!d.adding_to_existing, egui::Button::new("Browse…"))
-                            .clicked()
-                        {
-                            if let Some(f) = rfd::FileDialog::new()
-                                .add_filter("xzip archive", &["xzip"])
-                                .set_file_name(
-                                    d.destination
-                                        .file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy(),
-                                )
-                                .save_file()
-                            {
+                        if ui.add_enabled(!d.adding_to_existing, egui::Button::new("Browse…")).clicked() {
+                            if let Some(f) = rfd::FileDialog::new().add_filter("xzip archive", &["xzip"]).set_file_name(d.destination.file_name().unwrap_or_default().to_string_lossy()).save_file() {
                                 d.destination = f;
                             }
                         }
                     });
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("Compression").small().color(p.text_dim));
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("HOW HARD TO TRY").small().color(p.text_dim));
                     ui.horizontal(|ui| {
                         ui.add(egui::Slider::new(&mut d.level, 0..=9).show_value(true));
                         ui.label(RichText::new(level_hint(d.level)).color(p.text_dim));
                     });
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("Exclude (comma-separated globs, e.g. *.log, node_modules)")
-                            .small()
-                            .color(p.text_dim),
-                    );
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("LEAVE OUT (comma-separated patterns, e.g. *.log, node_modules)").small().color(p.text_dim));
                     ui.add(egui::TextEdit::singleline(&mut d.exclude).desired_width(f32::INFINITY));
-                    ui.add_space(14.0);
+                    ui.add_space(16.0);
                     ui.horizontal(|ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let ok = !d.sources.is_empty() && !d.destination.as_os_str().is_empty();
-                            if ui
-                                .add_enabled(
-                                    ok,
-                                    egui::Button::new(
-                                        RichText::new(format!("{}  Compress", ph::PACKAGE))
-                                            .strong(),
-                                    ),
-                                )
-                                .clicked()
-                            {
+                            if self.primary_button(ui, &format!("{}  Compress", ph::PACKAGE), ok) {
                                 action = Some(true);
                             }
                             if ui.button("Cancel").clicked() {
@@ -1607,18 +2051,14 @@ impl App {
                     self.archive.as_ref().map(|a| a.entries.len()).unwrap_or(0)
                 };
                 let m = egui::Modal::new(Id::new("extract")).show(ctx, |ui| {
-                    ui.set_width(520.0);
+                    ui.set_width(540.0);
                     ui.heading("Extract");
                     ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("Destination folder")
-                            .small()
-                            .color(p.text_dim),
-                    );
+                    ui.label(RichText::new("WHERE TO").small().color(p.text_dim));
                     ui.horizontal(|ui| {
                         let mut dest = d.destination.display().to_string();
                         if ui
-                            .add(egui::TextEdit::singleline(&mut dest).desired_width(400.0))
+                            .add(egui::TextEdit::singleline(&mut dest).desired_width(410.0))
                             .changed()
                         {
                             d.destination = PathBuf::from(dest);
@@ -1629,31 +2069,29 @@ impl App {
                             }
                         }
                     });
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
                     if !self.selection.is_empty() {
                         ui.radio_value(
                             &mut d.selected_only,
                             true,
-                            format!("Selected entries only ({count})"),
+                            format!("Just the selection ({count} entries)"),
                         );
                         ui.radio_value(&mut d.selected_only, false, "Everything");
                     } else {
                         ui.label(format!("Everything ({count} entries)"));
                     }
-                    ui.checkbox(
-                        &mut d.overwrite,
-                        "Replace files that already exist (links and folders are never replaced)",
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut d.overwrite, "Replace files that already exist there");
+                    ui.label(
+                        RichText::new("Links and folders are never replaced, whatever you tick.")
+                            .small()
+                            .color(p.text_dim),
                     );
-                    ui.checkbox(&mut d.open_after, "Open the folder when done");
-                    ui.add_space(14.0);
+                    ui.checkbox(&mut d.open_after, "Open the folder when it's done");
+                    ui.add_space(16.0);
                     ui.horizontal(|ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui
-                                .add(egui::Button::new(
-                                    RichText::new(format!("{}  Extract", ph::EXPORT)).strong(),
-                                ))
-                                .clicked()
-                            {
+                            if self.primary_button(ui, &format!("{}  Extract", ph::EXPORT), true) {
                                 action = Some(true);
                             }
                             if ui.button("Cancel").clicked() {
@@ -1674,9 +2112,10 @@ impl App {
             }
             Dialog::Skipped(list) => {
                 let m = egui::Modal::new(Id::new("skipped")).show(ctx, |ui| {
-                    ui.set_width(560.0);
-                    ui.heading(format!("{} items were not added", list.len()));
-                    ui.label(RichText::new("Links, special files and names that could not be extracted on every platform are left out on purpose.").color(p.text_dim));
+                    ui.set_width(580.0);
+                    ui.heading(format!("{} things were left out", list.len()));
+                    ui.label(RichText::new("Links, special files and names that could not be extracted on every platform are skipped on purpose.").color(p.text_dim));
+                    ui.add_space(6.0);
                     egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                         for s in &list {
                             ui.label(s.path.display().to_string());
@@ -1684,7 +2123,7 @@ impl App {
                         }
                     });
                     ui.add_space(8.0);
-                    if ui.button("Close").clicked() {
+                    if close_btn(ui) {
                         ui.close();
                     }
                 });
@@ -1694,16 +2133,22 @@ impl App {
             }
             Dialog::View(name, text) => {
                 let m = egui::Modal::new(Id::new("view")).show(ctx, |ui| {
-                    ui.set_width(820.0);
+                    ui.set_width(860.0);
                     ui.heading(&name);
-                    egui::ScrollArea::both().max_height(500.0).show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(RichText::new(&text).monospace().size(12.0))
-                                .selectable(true),
-                        );
-                    });
+                    egui::Frame::new()
+                        .fill(p.bg)
+                        .corner_radius(10)
+                        .inner_margin(10)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::both().max_height(520.0).show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(RichText::new(&text).monospace().size(12.0))
+                                        .selectable(true),
+                                );
+                            });
+                        });
                     ui.add_space(8.0);
-                    if ui.button("Close").clicked() {
+                    if close_btn(ui) {
                         ui.close();
                     }
                 });
@@ -1712,39 +2157,55 @@ impl App {
                 }
             }
             Dialog::Settings => {
-                let mut dark = self.dark;
+                let (mut dark, mut accent) = (self.dark, self.accent);
                 let m = egui::Modal::new(Id::new("settings")).show(ctx, |ui| {
-                    ui.set_width(440.0);
+                    ui.set_width(460.0);
                     ui.heading("Settings");
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("LOOK").small().color(p.text_dim));
                     ui.horizontal(|ui| {
-                        ui.label("Theme");
                         ui.selectable_value(&mut dark, true, format!("{} Dark", ph::MOON));
                         ui.selectable_value(&mut dark, false, format!("{} Light", ph::SUN));
+                        ui.add_space(12.0);
+                        for a in Accent::ALL {
+                            let (c, _) = a.colors(dark);
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+                            let painter = ui.painter();
+                            painter.circle_filled(rect.center(), 9.0, c);
+                            if a == accent {
+                                painter.circle_stroke(rect.center(), 11.0, Stroke::new(2.0, p.text));
+                            }
+                            if resp.on_hover_text(a.name()).clicked() {
+                                accent = a;
+                            }
+                        }
                     });
-                    ui.add_space(6.0);
-                    ui.label("Default compression level");
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("COMPRESSION").small().color(p.text_dim));
                     ui.horizontal(|ui| {
+                        ui.label("Default level");
                         ui.add(egui::Slider::new(&mut self.level, 0..=9));
-                        ui.label(RichText::new(level_hint(self.level)).color(p.text_dim));
+                        ui.label(RichText::new(level_hint(self.level)).small().color(p.text_dim));
                     });
-                    ui.add_space(6.0);
-                    ui.label("Worker threads (0 = all cores)");
-                    ui.add(egui::Slider::new(&mut self.threads, 0..=64));
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("Changes to threads apply to the next operation.")
-                            .small()
-                            .color(p.text_dim),
-                    );
-                    ui.add_space(12.0);
-                    if ui.button("Close").clicked() {
+                    ui.horizontal(|ui| {
+                        ui.label("Threads");
+                        ui.add(egui::Slider::new(&mut self.threads, 0..=64));
+                        ui.label(RichText::new(if self.threads == 0 { "all cores" } else { "" }).small().color(p.text_dim));
+                    });
+                    ui.checkbox(&mut self.filter_auto, "Executable filter: detect x86 / ARM64 / ARM / PowerPC / SPARC code and rewrite branch targets so it packs tighter");
+                    ui.label(RichText::new("Standard xz filters; the streams still open in xz and 7-Zip. Delta is tried on large non-code files.").small().color(p.text_dim));
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("AFTER EXTRACTING").small().color(p.text_dim));
+                    ui.checkbox(&mut self.open_after, "Open the destination folder");
+                    ui.add_space(14.0);
+                    if close_btn(ui) {
                         ui.close();
                     }
                 });
-                if dark != self.dark {
+                if dark != self.dark || accent != self.accent {
                     self.dark = dark;
-                    theme::apply(ctx, dark);
+                    self.accent = accent;
+                    self.retheme(ctx);
                 }
                 if !m.should_close() {
                     next = Dialog::Settings;
@@ -1752,15 +2213,19 @@ impl App {
             }
             Dialog::Security => {
                 let m = egui::Modal::new(Id::new("security")).show(ctx, |ui| {
-                    ui.set_width(640.0);
-                    ui.heading(format!("{}  What this archiver checks", ph::SHIELD_CHECK));
+                    ui.set_width(660.0);
+                    ui.heading(format!(
+                        "{}  What gets checked, and what gets refused",
+                        ph::SHIELD_CHECK
+                    ));
+                    ui.add_space(6.0);
                     egui::ScrollArea::vertical()
-                        .max_height(460.0)
+                        .max_height(470.0)
                         .show(ui, |ui| {
                             ui.label(SECURITY_NOTES);
                         });
                     ui.add_space(8.0);
-                    if ui.button("Close").clicked() {
+                    if close_btn(ui) {
                         ui.close();
                     }
                 });
@@ -1770,28 +2235,20 @@ impl App {
             }
             Dialog::About => {
                 let m = egui::Modal::new(Id::new("about")).show(ctx, |ui| {
-                    ui.set_width(420.0);
+                    ui.set_width(440.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new(ph::FILE_ARCHIVE).size(48.0).color(p.accent));
-                        ui.heading("xZip Archiver");
-                        ui.label(
-                            RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
-                                .color(p.text_dim),
-                        );
+                        self.logo(ui, 64.0);
                         ui.add_space(8.0);
-                        ui.label("Verified .xzip archives with Fast-LZMA2 compression.");
-                        ui.label(
-                            "Radix match finder, optimal parsing, standard .xz streams inside.",
-                        );
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Clinton Turner").strong());
-                        ui.label(
-                            RichText::new("All rights reserved.")
-                                .small()
-                                .color(p.text_dim),
-                        );
+                        ui.label(RichText::new("xZip Archiver").size(22.0).family(theme::semibold()));
+                        ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(p.text_dim));
+                        ui.add_space(10.0);
+                        ui.label("Verified archives. Fast-LZMA2 inside, written from scratch:");
+                        ui.label(RichText::new("radix match finder · optimal parser · executable filters · standard .xz streams").small().color(p.text_dim));
                         ui.add_space(12.0);
-                        if ui.button("Close").clicked() {
+                        ui.label(RichText::new("Made by Clinton Turner").family(theme::semibold()));
+                        ui.label(RichText::new("All rights reserved.").small().color(p.text_dim));
+                        ui.add_space(14.0);
+                        if close_btn(ui) {
                             ui.close();
                         }
                     });
@@ -1804,15 +2261,16 @@ impl App {
                 let mut action: Option<bool> = None;
                 let m = egui::Modal::new(Id::new("delete")).show(ctx, |ui| {
                     ui.set_width(440.0);
-                    ui.heading("Remove from archive?");
-                    ui.label(format!("{} entries will be removed. The archive is rewritten without recompressing anything.", paths.len()));
-                    ui.add_space(12.0);
+                    ui.heading("Remove from the archive?");
+                    ui.label(format!("{} entries go. The archive is rewritten without recompressing anything else.", paths.len()));
+                    ui.add_space(14.0);
                     ui.horizontal(|ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.add(egui::Button::new(RichText::new(format!("{}  Remove", ph::TRASH)).color(p.danger).strong())).clicked() {
+                            let btn = egui::Button::new(RichText::new(format!("{}  Remove", ph::TRASH)).color(Color32::WHITE).family(theme::semibold())).fill(p.danger).stroke(Stroke::NONE).corner_radius(9).min_size(Vec2::new(0.0, 34.0));
+                            if ui.add(btn).clicked() {
                                 action = Some(true);
                             }
-                            if ui.button("Cancel").clicked() {
+                            if ui.button("Keep them").clicked() {
                                 action = Some(false);
                             }
                         });
@@ -1851,29 +2309,34 @@ impl App {
             }
         }
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
-            let p = self.pal();
+            let p = self.pal;
             egui::Area::new(Id::new("drop_hint"))
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                 .order(egui::Order::Foreground)
+                .interactable(false)
                 .show(ctx, |ui| {
                     egui::Frame::new()
-                        .fill(p.accent_soft)
-                        .stroke(egui::Stroke::new(2.0, p.accent))
-                        .corner_radius(16)
-                        .inner_margin(28)
+                        .fill(theme::with_alpha(p.panel, 235))
+                        .stroke(Stroke::new(2.0, p.accent))
+                        .corner_radius(18)
+                        .inner_margin(30)
                         .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{}  Drop to {}",
-                                    ph::DOWNLOAD_SIMPLE,
-                                    if self.archive.is_some() {
-                                        "add to this archive"
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new(ph::DOWNLOAD_SIMPLE)
+                                        .size(40.0)
+                                        .color(p.accent),
+                                );
+                                ui.label(
+                                    RichText::new(if self.archive.is_some() {
+                                        "Drop to add to this archive"
                                     } else {
-                                        "create an archive"
-                                    }
-                                ))
-                                .size(20.0),
-                            );
+                                        "Drop to make an archive"
+                                    })
+                                    .size(20.0)
+                                    .family(theme::semibold()),
+                                );
+                            });
                         });
                 });
         }
@@ -1914,53 +2377,44 @@ impl App {
             }
         }
     }
-}
 
-fn ui_modifiers(resp: &egui::Response) -> (bool, bool) {
-    resp.ctx.input(|i| (i.modifiers.command, i.modifiers.shift))
-}
-
-fn level_hint(level: u32) -> &'static str {
-    match level {
-        0 => "store-ish, fastest",
-        1 | 2 => "fast",
-        3..=5 => "balanced",
-        6 | 7 => "optimal parsing, slower",
-        8 => "large dictionary, slow",
-        _ => "smallest, slowest",
-    }
-}
-
-fn shorten(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        s.to_string()
-    } else {
-        format!("…{}", s.chars().skip(n - max + 1).collect::<String>())
-    }
-}
-
-/// Tiny glob: `*` any run, `?` one char; enough for excludes like *.log or node_modules.
-fn glob_match(pat: &str, text: &str) -> bool {
-    fn rec(p: &[char], t: &[char]) -> bool {
-        match (p.first(), t.first()) {
-            (None, None) => true,
-            (Some('*'), _) => rec(&p[1..], t) || (!t.is_empty() && rec(p, &t[1..])),
-            (Some('?'), Some(_)) => rec(&p[1..], &t[1..]),
-            (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => rec(&p[1..], &t[1..]),
-            _ => false,
+    fn screenshot_step(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.screenshot.clone() else {
+            return;
+        };
+        self.frames += 1;
+        if self.frames == 40 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         }
+        let shot = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(img) = shot {
+            let (w, h) = (img.size[0] as u32, img.size[1] as u32);
+            let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+            if let Some(buf) = image::RgbaImage::from_raw(w, h, bytes) {
+                let _ = buf.save(&path);
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        ctx.request_repaint();
     }
-    let p: Vec<char> = pat.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    rec(&p, &t)
 }
 
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string("dark", if self.dark { "1" } else { "0" }.into());
+        storage.set_string("accent", self.accent.name().into());
         storage.set_string("level", self.level.to_string());
         storage.set_string("threads", self.threads.to_string());
+        storage.set_string(
+            "filter_auto",
+            if self.filter_auto { "1" } else { "0" }.into(),
+        );
+        storage.set_string("open_after", if self.open_after { "1" } else { "0" }.into());
         storage.set_string(
             "recent",
             self.recent
@@ -1972,57 +2426,56 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if !self.fonts_ready {
-            return;
-        }
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         self.poll_job(ctx);
-        let p = self.pal();
-        egui::Panel::top("toolbar")
+        let p = self.pal;
+        egui::Panel::top("header")
             .frame(
                 egui::Frame::new()
                     .fill(p.panel)
-                    .inner_margin(egui::Margin::symmetric(10, 8)),
+                    .inner_margin(egui::Margin::symmetric(12, 9)),
             )
-            .show(ui, |ui| self.toolbar(ui));
+            .show(ui, |ui| self.header(ui));
         egui::Panel::bottom("status")
             .frame(
                 egui::Frame::new()
                     .fill(p.panel)
-                    .inner_margin(egui::Margin::symmetric(12, 6)),
+                    .inner_margin(egui::Margin::symmetric(14, 7)),
             )
             .show(ui, |ui| self.status_bar(ui));
-        egui::Panel::left("sidebar")
-            .resizable(true)
-            .default_size(250.0)
-            .frame(egui::Frame::new().fill(p.panel).inner_margin(12))
-            .show(ui, |ui| self.sidebar(ui));
-        if self.show_details && self.archive.is_some() {
-            egui::Panel::right("details")
+        if self.archive.is_some() {
+            egui::Panel::left("sidebar")
                 .resizable(true)
-                .default_size(290.0)
+                .default_size(260.0)
                 .frame(egui::Frame::new().fill(p.panel).inner_margin(12))
-                .show(ui, |ui| self.details(ui));
-        }
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(12)).show(ui, |ui| {
-            if self.archive.is_some() {
-                self.breadcrumb(ui);
-                ui.add_space(6.0);
-                egui::Frame::new().fill(p.panel).corner_radius(12).inner_margin(6).show(ui, |ui| {
-                    self.table(ui);
-                });
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(ui.available_height() * 0.3);
-                        ui.label(RichText::new(ph::FILE_ARCHIVE).size(72.0).color(p.accent));
-                        ui.label(RichText::new("xZip Archiver").size(26.0).strong());
-                        ui.label(RichText::new("Open an archive (Ctrl+O), create one (Ctrl+N), or drop files here.").color(p.text_dim));
-                    });
-                });
+                .show(ui, |ui| self.sidebar(ui));
+            if self.show_details {
+                egui::Panel::right("details")
+                    .resizable(true)
+                    .default_size(300.0)
+                    .frame(egui::Frame::new().fill(p.panel).inner_margin(12))
+                    .show(ui, |ui| self.details(ui));
             }
-        });
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(p.bg).inner_margin(12))
+                .show(ui, |ui| {
+                    self.breadcrumb(ui);
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(p.panel)
+                        .corner_radius(14)
+                        .inner_margin(6)
+                        .stroke(Stroke::new(1.0, p.border))
+                        .show(ui, |ui| {
+                            self.table(ui);
+                        });
+                });
+        } else {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(p.bg))
+                .show(ui, |ui| self.hero(ui));
+        }
         self.dialogs(ctx);
         self.toasts(ctx);
         self.handle_keys_and_drops(ctx);

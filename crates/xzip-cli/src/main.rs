@@ -24,7 +24,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 
 use xzip_core::archive::{self, Archive, CreateOptions, Entry, ExtractOptions, Overwrite, Skipped};
-use xzip_core::{format_size, Error, Settings, Strategy};
+use xzip_core::{format_size, Error, Filter, FilterMode, Settings, Strategy};
 
 const EXIT_OK: i32 = 0;
 const EXIT_WARN: i32 = 1;
@@ -144,6 +144,9 @@ struct AddArgs {
     /// Fix lc/lp/pb instead of picking them by trial
     #[arg(long)]
     no_auto_props: bool,
+    /// Pre-filter: auto (default), none, x86, arm64, arm, armthumb, powerpc, sparc, delta:N
+    #[arg(long, value_name = "FILTER", default_value = "auto")]
+    filter: String,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -373,6 +376,10 @@ fn settings_from(a: &AddArgs) -> Result<Settings, String> {
     if a.no_auto_props {
         s.auto_props = false;
     }
+    s.filter = match a.filter.trim().to_ascii_lowercase().as_str() {
+        "auto" => FilterMode::Auto,
+        other => FilterMode::Fixed(Filter::parse(other).ok_or_else(|| format!("unknown filter {other:?} (auto, none, x86, arm64, arm, armthumb, powerpc, sparc, delta:N)"))?),
+    };
     s.validate().map_err(|e| e.to_string())?;
     Ok(s)
 }

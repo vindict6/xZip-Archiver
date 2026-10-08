@@ -12,6 +12,7 @@
 
 pub mod archive;
 pub mod error;
+pub mod filters;
 pub mod lzma;
 pub mod lzma2;
 pub mod optimal;
@@ -26,7 +27,8 @@ pub use archive::{
     CreateOptions, Entry, ExtractOptions, ExtractReport, Overwrite, Skipped,
 };
 pub use error::{Error, Result};
-pub use settings::{Settings, Strategy};
+pub use filters::Filter;
+pub use settings::{FilterMode, Settings, Strategy};
 pub use xz::Check;
 
 /// Human-readable size.

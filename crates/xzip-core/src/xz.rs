@@ -5,9 +5,10 @@
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+use crate::filters::{sniff_executable, Filter};
 use crate::lzma::Stats;
 use crate::lzma2::{self, Lzma2Decoder, Progress};
-use crate::settings::Settings;
+use crate::settings::{FilterMode, Settings};
 
 const HEADER_MAGIC: &[u8; 6] = b"\xFD7zXZ\x00";
 const FOOTER_MAGIC: &[u8; 2] = b"YZ";
@@ -139,10 +140,17 @@ fn prop_to_dict_size(b: u8) -> u32 {
     }
 }
 
-fn block_header(compressed: usize, uncompressed: usize, dict_prop: u8) -> Vec<u8> {
-    let mut body = vec![0x40 | 0x80]; // both sizes present, one filter
+fn block_header(compressed: usize, uncompressed: usize, dict_prop: u8, filter: Filter) -> Vec<u8> {
+    let nfilters: u8 = if filter == Filter::None { 1 } else { 2 };
+    let mut body = vec![0x40 | 0x80 | (nfilters - 1)]; // both sizes present, 1-2 filters
     body.extend(encode_varint(compressed as u64));
     body.extend(encode_varint(uncompressed as u64));
+    if filter != Filter::None {
+        let props = filter.props();
+        body.extend(encode_varint(filter.id()));
+        body.extend(encode_varint(props.len() as u64));
+        body.extend(props);
+    }
     body.extend(encode_varint(FILTER_LZMA2));
     body.extend(encode_varint(1));
     body.push(dict_prop);
@@ -172,13 +180,25 @@ pub fn compress(
     let mut used = settings.clone();
     let mut stats = Stats::default();
     if !data.is_empty() {
-        let (stream, s, st) = lzma2::encode(data, settings, progress)?;
+        let filter = match settings.filter {
+            FilterMode::Fixed(f) => f,
+            FilterMode::Auto => choose_filter(data, settings),
+        };
+        let (stream, s, st) = if filter == Filter::None {
+            lzma2::encode(data, settings, progress)?
+        } else {
+            let mut work = data.to_vec();
+            filter.encode(&mut work);
+            lzma2::encode(&work, settings, progress)?
+        };
         used = s;
         stats = st;
+        stats.filter = Some(filter);
         let header = block_header(
             stream.len(),
             data.len(),
             dict_size_to_prop(settings.dict_size),
+            filter,
         );
         let check_bytes = compute_check(check as u8, data).unwrap_or_default();
         out.extend_from_slice(&header);
@@ -207,10 +227,94 @@ pub fn compress(
     Ok((out, used, stats))
 }
 
+/// Settings for the quick trials that pick a filter: fast, small, decisive enough.
+fn trial_settings(s: &Settings) -> Settings {
+    Settings {
+        strategy: crate::settings::Strategy::Fast,
+        dict_size: 1 << 20,
+        radix_depth: 8,
+        radix_step: 4,
+        nice_len: 16,
+        auto_props: false,
+        skip_incompressible: false,
+        filter: FilterMode::Fixed(Filter::None),
+        lc: s.lc,
+        lp: s.lp,
+        pb: s.pb,
+        ..s.clone()
+    }
+}
+
+/// A sample for trials: up to three 64 KiB slices from the start, middle and end
+/// (code tends to sit near the start of an executable, data after it).
+fn trial_sample(data: &[u8]) -> Vec<u8> {
+    const SLICE: usize = 64 << 10;
+    if data.len() <= 3 * SLICE {
+        return data.to_vec();
+    }
+    let mut out = Vec::with_capacity(3 * SLICE);
+    for frac in [0.0, 0.4, 0.8] {
+        let start = ((data.len() as f64 * frac) as usize).min(data.len() - SLICE);
+        out.extend_from_slice(&data[start..start + SLICE]);
+    }
+    out
+}
+
+fn trial_size(sample: &[u8], filter: Filter, s: &Settings) -> usize {
+    let mut work = sample.to_vec();
+    filter.encode(&mut work);
+    lzma2::encode(&work, s, None)
+        .map(|(o, _, _)| o.len())
+        .unwrap_or(usize::MAX)
+}
+
+/// Pick a pre-filter for this data. An executable header decides the candidate;
+/// otherwise, for files big enough to matter, the usual suspects are tried. A
+/// filter is kept only when the trial shows a real gain.
+pub fn choose_filter(data: &[u8], settings: &Settings) -> Filter {
+    if data.len() < 4096 {
+        return Filter::None;
+    }
+    let hint = sniff_executable(data);
+    if hint.is_none() && data.len() < (256 << 10) {
+        return Filter::None;
+    }
+    let ts = trial_settings(settings);
+    let sample = trial_sample(data);
+    let base = trial_size(&sample, Filter::None, &ts);
+    let (candidates, min_gain): (Vec<Filter>, f64) = match hint {
+        Some(f) => (vec![f], 0.01),
+        None => (
+            vec![
+                Filter::X86,
+                Filter::Arm64,
+                Filter::Delta(0),
+                Filter::Delta(1),
+                Filter::Delta(2),
+                Filter::Delta(3),
+            ],
+            0.03,
+        ),
+    };
+    let mut best = (base, Filter::None);
+    for f in candidates {
+        let n = trial_size(&sample, f, &ts);
+        if n < best.0 {
+            best = (n, f);
+        }
+    }
+    if best.1 != Filter::None && (base - best.0) as f64 >= base as f64 * min_gain {
+        best.1
+    } else {
+        Filter::None
+    }
+}
+
 pub struct XzInfo {
     pub check: Check,
     pub blocks: usize,
     pub props: Option<(u32, u32, u32)>,
+    pub filter: Filter,
     pub dict_size: u32,
 }
 
@@ -222,6 +326,7 @@ pub fn decompress(blob: &[u8], max_output: usize) -> Result<(Vec<u8>, XzInfo)> {
         check: Check::None,
         blocks: 0,
         props: None,
+        filter: Filter::None,
         dict_size: 0,
     };
     let mut pos = 0;
@@ -307,19 +412,32 @@ fn decode_stream(
         } else {
             None
         };
+        // filter chain: an optional BCJ/Delta filter, then LZMA2 (always last)
         let nfilters = (bflags & 3) as usize + 1;
-        if nfilters != 1 {
+        if nfilters > 2 {
             return Err(Error::Corrupt(
-                "only plain LZMA2 is supported (no BCJ/Delta filters)".into(),
+                "unsupported filter chain (more than one pre-filter)".into(),
             ));
+        }
+        let mut pre = Filter::None;
+        if nfilters == 2 {
+            let fid = decode_varint(&header[..end], &mut p)?;
+            let psize = decode_varint(&header[..end], &mut p)? as usize;
+            let props = header
+                .get(p..p + psize)
+                .filter(|_| p + psize <= end)
+                .ok_or_else(|| Error::Corrupt("truncated filter properties".into()))?;
+            pre = Filter::from_id(fid, props)?;
+            p += psize;
         }
         let fid = decode_varint(&header[..end], &mut p)?;
         let psize = decode_varint(&header[..end], &mut p)? as usize;
         if fid != FILTER_LZMA2 || psize != 1 || p + 1 > end {
             return Err(Error::Corrupt(
-                "unsupported filter chain (only plain LZMA2 is supported)".into(),
+                "unsupported filter chain (the last filter must be LZMA2)".into(),
             ));
         }
+        info.filter = pre;
         let dict_prop = header[p];
         p += 1;
         if dict_prop > 40 {
@@ -348,7 +466,8 @@ fn decode_stream(
         let before = out.len();
         let mut dec = Lzma2Decoder::new(dict_size, size_hint);
         pos = dec.decode(blob, pos, limit)?;
-        let block_out = dec.dec.out;
+        let mut block_out = dec.dec.out;
+        pre.decode(&mut block_out);
         info.props = dec.props.or(info.props);
         let comp_size = pos - data_start;
         if comp.is_some_and(|c| c as usize != comp_size) {
