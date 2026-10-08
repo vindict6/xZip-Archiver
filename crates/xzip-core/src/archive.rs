@@ -358,7 +358,7 @@ impl ArchiveWriter {
             context: format!("saving {}", self.out_path.display()),
             source: e.error,
         })?;
-        // std::fs::rename adds the \?\ prefix for long paths on Windows; MoveFileEx alone does not
+        // std::fs::rename adds the \\?\ prefix for long paths on Windows; MoveFileEx alone does not
         fs::rename(&tmp_path, &self.out_path).map_err(|e| {
             let _ = fs::remove_file(&tmp_path);
             Error::Io {
