@@ -1,0 +1,4 @@
+[advisories]
+# paste (a proc-macro helper used by egui's font stack) is unmaintained but has no
+# known vulnerability; revisit when the egui ecosystem drops it.
+ignore = ["RUSTSEC-2024-0436"]
