@@ -32,8 +32,8 @@ no Windows device names, no trailing dots or spaces, no names that differ only b
 While writing
   • Folders are created one level at a time and proven (canonical path) to be real folders inside the destination. A planted link \
 or junction cannot redirect a write.
-  • Each file's compressed bytes are hashed before decoding, and the result is hashed before it is written, to a new temp file that is \
-then renamed into place. Existing files are kept unless you choose to replace them; links and folders are never replaced.
+  • Each file's compressed bytes are hashed before decoding, and the result is hashed before it is written, to a newly created file \
+(the write fails if anything already exists there). Existing files are kept unless you choose to replace them; links and folders are never replaced.
   • The format stores regular files and folders only: no links, no devices, no special permissions.
 
 What hashes do not do

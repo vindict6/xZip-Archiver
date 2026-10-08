@@ -103,9 +103,10 @@ where a folder is needed.
 **Writing.** Every path is validated before the first byte is written. Folders
 are created one level at a time with `mkdir` and proven by canonical path to be
 real folders inside the destination, so a symlink or junction planted in the
-destination cannot redirect a write. Each file is written to a fresh temp file
-beside its target and renamed into place; existing files are kept unless you ask
-to replace them, and links and folders are never replaced. Sizes are enforced
+destination cannot redirect a write. Each file is created with create-new
+semantics (the open fails if anything already exists there), so a write never
+goes through an existing file or link; existing files are kept unless you ask to
+replace them, and links and folders are never replaced. Sizes are enforced
 (a stream must produce exactly its declared size), per-file and total caps
 apply, and free disk space is checked up front. The format stores regular files
 and folders only: no links, devices or special permissions can be smuggled in.

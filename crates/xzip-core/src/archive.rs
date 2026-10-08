@@ -155,7 +155,7 @@ fn mtime_to_system(t: i64) -> SystemTime {
 
 // ---- Writing ------------------------------------------------------------------------
 
-/// Writes an archive incrementally to a temp file beside the target and renames it
+/// Writes an archive incrementally to a temp file beside the target and moves it
 /// into place at the end, so a crash never leaves a half-written .xzip.
 pub struct ArchiveWriter {
     out_path: PathBuf,
@@ -358,14 +358,22 @@ impl ArchiveWriter {
             context: format!("saving {}", self.out_path.display()),
             source: e.error,
         })?;
-        // std::fs::rename adds the \\?\ prefix for long paths on Windows; MoveFileEx alone does not
-        fs::rename(&tmp_path, &self.out_path).map_err(|e| {
+        if let Err(e) = fs::rename(&tmp_path, &self.out_path) {
+            // MoveFileEx can refuse long paths; fall back to a plain copy
+            let copied = fs::read(&tmp_path).and_then(|bytes| {
+                let _ = fs::remove_file(&self.out_path);
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&self.out_path)
+                    .and_then(|mut f| f.write_all(&bytes))
+            });
             let _ = fs::remove_file(&tmp_path);
-            Error::Io {
+            copied.map_err(|_| Error::Io {
                 context: format!("saving {}", self.out_path.display()),
                 source: e,
-            }
-        })?;
+            })?;
+        }
         Ok(self.entries)
     }
 }
@@ -959,30 +967,22 @@ impl Archive {
                     done += e.size;
                     continue;
                 }
+                fs::remove_file(&target).map_err(io_path("replacing", &target))?;
             }
             let data = self.read(e, opts.max_entry_size)?;
-            // fresh temp file beside the target, renamed into place: never written
-            // through an existing file or link
-            let mut tmp = tempfile::Builder::new()
-                .prefix(".xzip-")
-                .tempfile_in(&parent)
-                .map_err(io_path("creating file in", &parent))?;
-            tmp.write_all(&data).map_err(io_path("writing", &target))?;
+            // Create-new semantics: the open fails if anything exists at the target, so a
+            // write never goes through an existing file or link. (A rename into place
+            // would be atomic as well, but MoveFileEx is unreliable with long paths.)
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map_err(io_path("creating", &target))?;
+            f.write_all(&data).map_err(io_path("writing", &target))?;
             #[cfg(unix)]
             if e.executable() {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o755));
-            }
-            let (f, tmp_path) = tmp.keep().map_err(|err| Error::Io {
-                context: format!("saving {}", target.display()),
-                source: err.error,
-            })?;
-            if let Err(err) = fs::rename(&tmp_path, &target) {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(Error::Io {
-                    context: format!("saving {}", target.display()),
-                    source: err,
-                });
+                let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o755));
             }
             let _ = f.set_modified(mtime_to_system(e.mtime));
             report.written.push(e.path.clone());
