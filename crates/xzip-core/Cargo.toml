@@ -1,0 +1,22 @@
+[package]
+name = "xzip-core"
+description = "Fast-LZMA2 style .xz compressor and the .xzip archive format"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+crc32fast = "1.5.2"
+fs4 = "1.1.0"
+rayon = "1.12.0"
+sha2 = "0.10.9"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+unicode-normalization = "0.1.25"
+walkdir = "2.5.0"
+
+[dev-dependencies]
+lzma-rs = "0.3.0"

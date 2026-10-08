@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=xZip Archiver
+Comment=Verified .xzip archives with Fast-LZMA2 compression
+Exec=xzip-gui %f
+Icon=xzip-gui
+Terminal=false
+Categories=Utility;Archiving;Compression;
+MimeType=application/x-xzip;

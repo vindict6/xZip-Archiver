@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/xzip-core", "crates/xzip-cli", "crates/xzip-gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Clinton Turner"]
+license-file = "LICENSE"
+repository = "https://github.com/vindict6/xZip-Archiver"
+rust-version = "1.85"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+overflow-checks = true
+strip = true
+panic = "unwind"
+
+[profile.dev]
+opt-level = 1

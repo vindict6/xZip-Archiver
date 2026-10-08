@@ -1,0 +1,6 @@
+/target
+/dist
+*.xzip
+*.swp
+.DS_Store
+Thumbs.db
