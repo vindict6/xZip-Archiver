@@ -783,16 +783,21 @@ impl App {
             .iter()
             .map(|p| dir.join(p.replace('/', std::path::MAIN_SEPARATOR_STR)))
             .collect();
-        let result = drag::start_drag(
-            frame,
-            drag::DragItem::Files(files),
-            drag::Image::Raw(theme::LOGO_PNG.to_vec()),
-            |_, _| {},
-            drag::Options::default(),
-        );
-        if let Err(e) = result {
-            self.notify(format!("Drag failed: {e}"), true);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let result = drag::start_drag(
+                frame,
+                drag::DragItem::Files(files),
+                drag::Image::Raw(theme::LOGO_PNG.to_vec()),
+                |_, _| {},
+                drag::Options::default(),
+            );
+            if let Err(e) = result {
+                self.notify(format!("Drag failed: {e}"), true);
+            }
         }
+        #[cfg(target_os = "linux")]
+        let _ = (files, frame);
     }
 
     fn cleanup_drag_dirs(&mut self) {
