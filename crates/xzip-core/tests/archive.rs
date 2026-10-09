@@ -19,7 +19,78 @@ fn opts(s: &Settings) -> CreateOptions<'_> {
         settings: s,
         follow_symlinks: false,
         filter: &|_| true,
+        password: None,
     }
+}
+
+#[test]
+fn password_protection() {
+    let d = tempfile::tempdir().unwrap();
+    let src = d.path().join("secret-plans");
+    fs::create_dir_all(src.join("q3")).unwrap();
+    fs::write(
+        src.join("q3").join("budget-numbers.txt"),
+        pseudo_random(50_000, 7),
+    )
+    .unwrap();
+    fs::write(src.join("readme.md"), b"top secret").unwrap();
+    let arc = d.path().join("locked.xzip");
+    let s = settings();
+    let o = CreateOptions {
+        password: Some("correct horse battery staple"),
+        ..opts(&s)
+    };
+    create_archive(&arc, std::slice::from_ref(&src), &o, None).unwrap();
+
+    // names and contents are not in the file in the clear
+    let blob = fs::read(&arc).unwrap();
+    let find = |needle: &[u8]| blob.windows(needle.len()).any(|w| w == needle);
+    assert!(!find(b"budget-numbers"));
+    assert!(!find(b"secret-plans"));
+    assert!(!find(b"top secret"));
+
+    assert!(matches!(open_archive(&arc), Err(Error::PasswordRequired)));
+    assert!(is_encrypted_file(&arc).unwrap());
+    assert!(matches!(
+        open_archive_with(&arc, Some("wrong")),
+        Err(Error::WrongPassword)
+    ));
+    let a = open_archive_with(&arc, Some("correct horse battery staple")).unwrap();
+    assert!(a.is_encrypted());
+    assert_eq!(a.entries.len(), 4);
+    assert_eq!(a.verify(None).unwrap(), 2);
+    let readme = a.find("secret-plans/readme.md").unwrap();
+    assert_eq!(a.read(readme, 1 << 20).unwrap(), b"top secret");
+    let out = d.path().join("out");
+    a.extract(&out, None, &ExtractOptions::default(), None)
+        .unwrap();
+    assert_eq!(
+        fs::read(out.join("secret-plans/q3/budget-numbers.txt")).unwrap(),
+        pseudo_random(50_000, 7)
+    );
+
+    // a rebuild (delete) keeps the archive locked with the same password
+    let keep: Vec<&Entry> = a
+        .entries
+        .iter()
+        .filter(|e| e.name() != "readme.md")
+        .collect();
+    let arc2 = d.path().join("locked2.xzip");
+    rebuild_archive(&a, &arc2, &keep, &[], &opts(&s), None).unwrap();
+    assert!(matches!(open_archive(&arc2), Err(Error::PasswordRequired)));
+    let a2 = open_archive_with(&arc2, Some("correct horse battery staple")).unwrap();
+    assert_eq!(a2.entries.len(), 3);
+    assert_eq!(a2.verify(None).unwrap(), 1);
+
+    // flipping any byte is caught by the whole-file hash before any decryption
+    let mut bad = blob.clone();
+    bad[300] ^= 0x40;
+    let bad_path = d.path().join("bad.xzip");
+    fs::write(&bad_path, &bad).unwrap();
+    assert!(matches!(
+        open_archive_with(&bad_path, Some("correct horse battery staple")),
+        Err(Error::Integrity(_))
+    ));
 }
 
 fn pseudo_random(n: usize, mut x: u64) -> Vec<u8> {

@@ -11,6 +11,7 @@
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 
 pub mod archive;
+pub mod crypto;
 pub mod error;
 pub mod filters;
 pub mod lzma;
@@ -23,8 +24,9 @@ pub mod settings;
 pub mod xz;
 
 pub use archive::{
-    create_archive, load_archive, open_archive, rebuild_archive, Archive, ArchiveProgress,
-    CreateOptions, Entry, ExtractOptions, ExtractReport, Overwrite, Skipped,
+    create_archive, load_archive, load_archive_with, open_archive, open_archive_with,
+    rebuild_archive, Archive, ArchiveProgress, CreateOptions, Entry, ExtractOptions, ExtractReport,
+    Overwrite, Skipped,
 };
 pub use error::{Error, Result};
 pub use filters::Filter;

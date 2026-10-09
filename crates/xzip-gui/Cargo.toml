@@ -27,3 +27,6 @@ winresource = "0.1.31"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 drag = "2.1.1"
+
+[target."cfg(windows)".dependencies]
+winreg = "0.55"

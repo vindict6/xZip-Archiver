@@ -79,8 +79,26 @@ existing files on extract (default is to keep them and warn), `--dry-run`,
 `--json` for scripts, `-q` / `-v`, `--no-progress`, `--color auto|always|never`.
 `NO_COLOR` is respected. Progress bars only appear on a terminal.
 
+Passwords: `-p PASSWORD` (or `XZIP_PASSWORD`), `--password-file FILE`, or
+`--ask-password` to be prompted. Creating with a password encrypts the archive;
+every other command unlocks with it, and prompts on a terminal if none was given.
+
 Exit codes: `0` success · `1` finished with warnings (skipped files) · `2` usage
-error · `3` integrity failure (refused) · `4` I/O or other error · `130` interrupted.
+error, missing or wrong password · `3` integrity failure (refused) · `4` I/O or
+other error · `130` interrupted.
+
+### Explorer integration (Windows)
+
+`xzip-gui.exe --register-explorer` associates `.xzip` files (icon, double-click
+to open) and adds "Extract here", "Extract to folder" and "Test archive" to
+their right-click menu, plus "Add to xZip archive…" on any file or folder. It
+writes only to the current user's registry, so no administrator prompt. Other
+switches: `--register-file-type`, `--register-context-menu`, `--unregister-explorer`,
+`--unregister-context-menu`, `--explorer-status`. The same controls are in
+Settings → Explorer. The verbs themselves are plain launch parameters you can
+use from anywhere: `--extract-here A.xzip`, `--extract-to A.xzip`,
+`--test A.xzip`, `--add PATH...`. On Windows 11 the entries live under
+"Show more options" (the compact menu is reserved for store-packaged apps).
 
 ## The desktop app
 
@@ -91,11 +109,22 @@ browse it like a folder, and:
 - select with click, Ctrl+click and Shift+click; right-click for a context menu
 - Extract all or just the selection, choose to replace existing files or keep them
 - Test decodes every file and checks every hash
-- View shows text or a hex dump without extracting
+- View shows a file as text, hex or binary without extracting
+- set a password when creating; opening a locked archive asks for it
 - the details pane shows sizes, dates and the SHA-256 of any file
 - Ctrl+O open · Ctrl+N new · Ctrl+F search · Backspace up · Delete remove · Esc cancel
 
 ## Security: what is checked and refused
+
+**Passwords.** A password-protected archive is sealed with AES-256-GCM under a
+random 256-bit key, which is wrapped by a key derived from the password with
+Argon2id (64 MiB, 3 passes). Names, sizes, dates and contents are all inside
+the sealed data; the file reveals only that it is an xzip archive and how big
+it is. There is nothing secret in the program: the format and the source are
+public, and the protection rests entirely on the password and on the cost of
+guessing it. Hashes still cover the sealed bytes, so a damaged or modified
+file is refused before any decryption is attempted, and a wrong password fails
+cleanly on the key unwrap.
 
 **Before anything is shown.** Whole-file SHA-256 against the trailer, header
 CRC32, manifest SHA-256, strict bounds on every field (entry counts, offsets,

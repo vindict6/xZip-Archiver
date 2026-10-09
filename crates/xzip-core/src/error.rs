@@ -27,6 +27,12 @@ pub enum Error {
 
     #[error("cancelled")]
     Cancelled,
+
+    #[error("this archive is password protected")]
+    PasswordRequired,
+
+    #[error("wrong password")]
+    WrongPassword,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -15,9 +15,11 @@ use egui_phosphor::regular as ph;
 use xzip_core::archive::{
     self, Archive, CreateOptions, Entry, ExtractOptions, ExtractReport, Overwrite, Skipped,
 };
-use xzip_core::{format_size, Filter, FilterMode, Settings};
+use xzip_core::{format_size, Error, Filter, FilterMode, Settings};
 
+use crate::explorer;
 use crate::theme::{self, Accent, Palette};
+use crate::{Launch, Pending};
 
 const RECENT_MAX: usize = 10;
 const NOTICE_SECS: f32 = 15.0;
@@ -26,6 +28,7 @@ const DRAG_LIMIT: u64 = 512 << 20;
 
 enum JobResult {
     Opened(Box<Archive>),
+    NeedsPassword(PathBuf, Option<String>),
     Created(PathBuf, Vec<Skipped>),
     Extracted(ExtractReport, PathBuf),
     Verified(usize),
@@ -137,6 +140,7 @@ enum Dialog {
     None,
     Compress(CompressDialog),
     Extract(ExtractDialog),
+    Password(PasswordDialog),
     Skipped(Vec<Skipped>),
     View(ViewState),
     Settings,
@@ -151,6 +155,9 @@ struct CompressDialog {
     level: u32,
     exclude: String,
     adding_to_existing: bool,
+    password: String,
+    confirm: String,
+    show_password: bool,
 }
 
 struct ExtractDialog {
@@ -160,6 +167,13 @@ struct ExtractDialog {
     open_after: bool,
 }
 
+struct PasswordDialog {
+    path: PathBuf,
+    text: String,
+    error: Option<String>,
+    show: bool,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum SortCol {
     Name,
@@ -167,6 +181,13 @@ enum SortCol {
     Packed,
     Ratio,
     Modified,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    General,
+    Compression,
+    Explorer,
 }
 
 pub struct App {
@@ -189,6 +210,10 @@ pub struct App {
     job: Option<Job>,
     notice: Option<Notice>,
     dialog: Dialog,
+    settings_tab: SettingsTab,
+    explorer_want: explorer::Integration,
+    explorer_note: Option<(String, bool)>,
+    pending: Option<Pending>,
     pending_drag: bool,
     drag_dirs: Vec<PathBuf>,
     screenshot: Option<PathBuf>,
@@ -356,8 +381,33 @@ fn card(p: &Palette) -> egui::Frame {
         .stroke(Stroke::new(1.0, p.border))
 }
 
+/// Plain words for the reasons collect_sources gives.
+fn skip_reason(reason: &str) -> String {
+    let r = reason.to_ascii_lowercase();
+    if r.contains("cannot find") || r.contains("no such file") || r.contains("os error 2)") {
+        "Not found when compression started. It may have been moved, renamed or deleted.".into()
+    } else if r.contains("os error 5)") || r.contains("permission denied") {
+        "Could not be read (permission denied).".into()
+    } else {
+        reason.to_string()
+    }
+}
+
+/// Extract-to destination for a verb: a folder named after the archive, beside it.
+fn folder_beside(archive: &Path) -> PathBuf {
+    let stem = archive
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "extracted".into());
+    archive
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+        .join(stem)
+}
+
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, launch: Launch) -> Self {
         cc.egui_ctx.set_fonts(theme::fonts());
         let storage = cc.storage;
         let get = |k: &str| storage.and_then(|s| s.get_string(k));
@@ -399,22 +449,19 @@ impl App {
             job: None,
             notice: None,
             dialog: Dialog::None,
+            settings_tab: SettingsTab::General,
+            explorer_want: explorer::Integration::default(),
+            explorer_note: None,
+            pending: launch.pending,
             pending_drag: false,
             drag_dirs: Vec::new(),
-            screenshot: None,
+            screenshot: launch.screenshot,
             frames: 0,
         };
-        // xzip-gui [archive] [--screenshot out.png]  (renders a frame to a file and exits)
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        let mut i = 0;
-        while i < args.len() {
-            if args[i] == "--screenshot" && i + 1 < args.len() {
-                app.screenshot = Some(PathBuf::from(&args[i + 1]));
-                i += 1;
-            } else if Path::new(&args[i]).is_file() {
-                app.open_path(PathBuf::from(&args[i]));
-            }
-            i += 1;
+        if let Some(path) = launch.open {
+            app.open_path(path, None);
+        } else if !launch.add.is_empty() {
+            app.action_new(launch.add);
         }
         app
     }
@@ -505,6 +552,7 @@ impl App {
             JobResult::Opened(a) => {
                 let files = a.entries.iter().filter(|e| !e.is_dir()).count();
                 let path = a.path.clone();
+                let locked = a.is_encrypted();
                 self.archive = Some(Arc::new(*a));
                 self.folder.clear();
                 self.selection.clear();
@@ -524,20 +572,56 @@ impl App {
                     }
                 }
                 self.remember(&path);
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 self.notify(
                     format!(
-                        "Opened {} ({files} files, {secs:.1} s)",
-                        path.file_name().unwrap_or_default().to_string_lossy()
+                        "Opened {name} ({files} files{}, {secs:.1} s)",
+                        if locked { ", unlocked" } else { "" }
                     ),
                     false,
                 );
+                // a verb from Explorer or the command line carries on from here
+                match self.pending.take() {
+                    Some(Pending::ExtractHere) => {
+                        let dest = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                        self.start_extract(ExtractDialog {
+                            destination: dest,
+                            overwrite: false,
+                            selected_only: false,
+                            open_after: false,
+                        });
+                    }
+                    Some(Pending::ExtractTo) => {
+                        let dest = folder_beside(&path);
+                        self.start_extract(ExtractDialog {
+                            destination: dest,
+                            overwrite: false,
+                            selected_only: false,
+                            open_after: true,
+                        });
+                    }
+                    Some(Pending::Test) => self.start_verify(),
+                    None => {}
+                }
+            }
+            JobResult::NeedsPassword(path, error) => {
+                self.dialog = Dialog::Password(PasswordDialog {
+                    path,
+                    text: String::new(),
+                    error,
+                    show: false,
+                });
             }
             JobResult::Created(path, skipped) => {
                 if !skipped.is_empty() {
                     self.dialog = Dialog::Skipped(skipped);
                 }
                 self.notify(format!("Archive written ({secs:.1} s)"), false);
-                self.open_path(path);
+                self.open_path(path, None);
             }
             JobResult::Extracted(report, _dest) => {
                 let msg = if report.skipped.is_empty() {
@@ -561,6 +645,7 @@ impl App {
                 self.dialog = Dialog::View(ViewState::new(name, data, self.view_mode));
             }
             JobResult::Failed(msg, integrity) => {
+                self.pending = None;
                 let text = if job.name == "Testing" {
                     format!("File integrity check failed: {msg}")
                 } else if integrity {
@@ -573,11 +658,16 @@ impl App {
         }
     }
 
-    fn open_path(&mut self, path: PathBuf) {
+    /// Open (verify) an archive; a locked one without a password comes back as a prompt.
+    fn open_path(&mut self, path: PathBuf, password: Option<String>) {
         self.start_job("Verifying", move |report| {
             report(0, 1, "hashing");
-            match archive::open_archive(&path) {
+            match archive::open_archive_with(&path, password.as_deref()) {
                 Ok(a) => JobResult::Opened(Box::new(a)),
+                Err(Error::PasswordRequired) => JobResult::NeedsPassword(path, None),
+                Err(Error::WrongPassword) => {
+                    JobResult::NeedsPassword(path, Some("Wrong password. Try again.".into()))
+                }
                 Err(e) => JobResult::Failed(e.to_string(), e.is_integrity()),
             }
         });
@@ -603,6 +693,11 @@ impl App {
             .collect();
         let dest = d.destination.clone();
         let sources = d.sources.clone();
+        let password = if d.password.is_empty() {
+            None
+        } else {
+            Some(d.password.clone())
+        };
         self.start_job("Compressing", move |report| {
             let filter = move |p: &str| -> bool {
                 let name = p.rsplit('/').next().unwrap_or(p);
@@ -614,6 +709,7 @@ impl App {
                 settings: &settings,
                 follow_symlinks: false,
                 filter: &filter,
+                password: password.as_deref(),
             };
             let result = match &existing {
                 Some(old) => {
@@ -657,7 +753,6 @@ impl App {
         };
         let dest = d.destination.clone();
         let open_after = d.open_after;
-        self.open_after = open_after;
         self.start_job("Extracting", move |report| {
             let sel: Option<Vec<&Entry>> = selected.as_ref().map(|paths| {
                 a.entries
@@ -724,6 +819,7 @@ impl App {
                 settings: &settings,
                 follow_symlinks: false,
                 filter: &|_| true,
+                password: None,
             };
             match archive::rebuild_archive(&a, &a.path, &keep, &[], &opts, Some(report)) {
                 Ok(_) => JobResult::Created(a.path.clone(), Vec::new()),
@@ -895,7 +991,7 @@ impl App {
             .add_filter("All files", &["*"])
             .pick_file()
         {
-            self.open_path(p);
+            self.open_path(p, None);
         }
     }
 
@@ -914,6 +1010,9 @@ impl App {
             level: self.level,
             exclude: String::new(),
             adding_to_existing: false,
+            password: String::new(),
+            confirm: String::new(),
+            show_password: false,
         });
     }
 
@@ -927,6 +1026,9 @@ impl App {
                     level: self.level,
                     exclude: String::new(),
                     adding_to_existing: true,
+                    password: String::new(),
+                    confirm: String::new(),
+                    show_password: false,
                 });
             }
             None => self.action_new(sources),
@@ -949,7 +1051,7 @@ impl App {
     fn logo(&self, ui: &mut egui::Ui, size: f32) {
         match &self.logo {
             Some(tex) => {
-                ui.add(egui::Image::new((tex.id(), Vec2::splat(size))).corner_radius(size * 0.18));
+                ui.add(egui::Image::new((tex.id(), Vec2::splat(size))));
             }
             None => {
                 ui.label(
@@ -1015,7 +1117,7 @@ impl App {
         let sel = !self.selection.is_empty();
         ui.horizontal(|ui| {
             ui.add_space(4.0);
-            self.logo(ui, 32.0);
+            self.logo(ui, 34.0);
             ui.add_space(4.0);
             ui.vertical(|ui| {
                 ui.add_space(1.0);
@@ -1088,7 +1190,7 @@ impl App {
             }
             if let Some(r) = open_recent {
                 if r.exists() {
-                    self.open_path(r);
+                    self.open_path(r, None);
                 } else {
                     self.recent.retain(|x| x != &r);
                     self.notify(
@@ -1160,16 +1262,22 @@ impl App {
                     self.retheme(ui.ctx());
                 }
                 if self.icon_button(ui, ph::GEAR_SIX, "Settings") {
-                    self.dialog = Dialog::Settings;
+                    self.open_settings();
                 }
                 if self.icon_button(ui, ph::INFO, "About") {
                     self.dialog = Dialog::About;
                 }
-                if self.icon_button(ui, ph::SHIELD_CHECK, "What gets checked") {
+                if self.icon_button(ui, ph::SHIELD_CHECK, "What is checked") {
                     self.dialog = Dialog::Security;
                 }
             });
         });
+    }
+
+    fn open_settings(&mut self) {
+        self.explorer_want = explorer::status();
+        self.explorer_note = None;
+        self.dialog = Dialog::Settings;
     }
 
     /// Left column: a compact archive summary, then the details of the selection.
@@ -1249,6 +1357,18 @@ impl App {
                         .color(p.ok)
                         .family(theme::semibold()),
                 );
+                if a.is_encrypted() {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(ph::LOCK_KEY).color(p.accent).size(16.0));
+                    ui.label(
+                        RichText::new("Encrypted")
+                            .color(p.accent)
+                            .family(theme::semibold()),
+                    )
+                    .on_hover_text(
+                        "AES-256-GCM, key from Argon2id. Names and contents are sealed.",
+                    );
+                }
             });
             ui.horizontal(|ui| {
                 ui.add(
@@ -1549,7 +1669,8 @@ impl App {
         let rows = self.rows();
         let max_size = rows.iter().map(|r| r.size).max().unwrap_or(0).max(1) as f32;
         if rows.is_empty() {
-            ui.add_space(40.0);
+            let h = ui.available_height();
+            ui.add_space((h / 2.0 - 48.0).max(20.0));
             ui.vertical_centered(|ui| {
                 ui.label(
                     RichText::new(ph::FOLDER_DASHED)
@@ -1565,6 +1686,7 @@ impl App {
                     .color(p.text_dim),
                 );
             });
+            ui.add_space((h / 2.0 - 48.0).max(20.0));
             return;
         }
         let mut enter: Option<String> = None;
@@ -1575,7 +1697,6 @@ impl App {
         let mut copy_text: Option<(String, &str)> = None;
         let mut sort_click: Option<SortCol> = None;
         let mut drag_from: Option<String> = None;
-        let height = ui.available_height();
         let header_col = |ui: &mut egui::Ui,
                           label: &str,
                           col: SortCol,
@@ -1603,6 +1724,7 @@ impl App {
         TableBuilder::new(ui)
             .striped(true)
             .resizable(false)
+            .auto_shrink(egui::Vec2b::new(false, true))
             .sense(Sense::click_and_drag())
             .cell_layout(Layout::left_to_right(Align::Center))
             .column(Column::remainder().at_least(160.0).clip(true))
@@ -1610,7 +1732,6 @@ impl App {
             .column(Column::exact(95.0))
             .column(Column::exact(62.0))
             .column(Column::exact(130.0))
-            .min_scrolled_height(height - 10.0)
             .header(26.0, |mut h| {
                 h.col(|ui| header_col(ui, "NAME", SortCol::Name, self.sort, &mut sort_click));
                 h.col(|ui| header_col(ui, "SIZE", SortCol::Size, self.sort, &mut sort_click));
@@ -1737,6 +1858,14 @@ impl App {
                     });
                 });
             });
+        // the empty space under the rows: clicking it clears the selection
+        let rest = ui.available_size();
+        if rest.y > 0.0 {
+            let (_, blank) = ui.allocate_exact_size(rest, Sense::click());
+            if blank.clicked() {
+                self.selection.clear();
+            }
+        }
         if let Some(col) = sort_click {
             self.sort = if self.sort.0 == col {
                 (col, !self.sort.1)
@@ -1890,9 +2019,9 @@ impl App {
         let mut open = false;
         let mut new_files = false;
         ui.vertical_centered(|ui| {
-            ui.add_space(full.height() * 0.16);
-            self.logo(ui, 96.0);
-            ui.add_space(16.0);
+            ui.add_space(full.height() * 0.14);
+            self.logo(ui, 120.0);
+            ui.add_space(12.0);
             ui.label(
                 RichText::new("Your files, sealed and verified.")
                     .size(32.0)
@@ -1906,7 +2035,7 @@ impl App {
             );
             ui.label(
                 RichText::new(
-                    "Every archive is checked byte for byte before a single file is shown.",
+                    "Every archive is checked byte-for-byte before a single file is shown.",
                 )
                 .size(17.0)
                 .color(p.text),
@@ -1915,11 +2044,11 @@ impl App {
             ui.horizontal(|ui| {
                 let total = 2.0 * 230.0 + 14.0;
                 ui.add_space((ui.available_width() - total).max(0.0) / 2.0);
-                if self.hero_card(ui, ph::PLUS_CIRCLE, "Make a new archive", p.accent2) {
+                if self.hero_card(ui, ph::PLUS_CIRCLE, "New Archive", p.accent2) {
                     new_files = true;
                 }
                 ui.add_space(14.0);
-                if self.hero_card(ui, ph::FOLDER_OPEN, "Open an archive", p.accent) {
+                if self.hero_card(ui, ph::FOLDER_OPEN, "Open Archive", p.accent) {
                     open = true;
                 }
             });
@@ -1942,12 +2071,6 @@ impl App {
             .ctx()
             .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
         let painter = ui.painter();
-        let rect = rect.translate(Vec2::new(0.0, -2.0 * hover));
-        painter.rect_filled(
-            rect.translate(Vec2::new(0.0, 4.0)),
-            14.0,
-            Color32::from_black_alpha((50.0 * hover) as u8),
-        );
         painter.rect_filled(rect, 14.0, theme::mix(p.card, p.hover, hover));
         painter.rect_stroke(
             rect,
@@ -2043,10 +2166,7 @@ impl App {
                 });
                 ui.add_space(4.0);
                 for l in lines {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(ph::DOT).color(p.text_dim));
-                        ui.label(*l);
-                    });
+                    ui.add(egui::Label::new(*l).wrap());
                 }
             });
         ui.add_space(8.0);
@@ -2062,6 +2182,22 @@ impl App {
         });
     }
 
+    fn password_field(
+        ui: &mut egui::Ui,
+        text: &mut String,
+        hint: &str,
+        show: bool,
+        id: &str,
+    ) -> egui::Response {
+        ui.add(
+            egui::TextEdit::singleline(text)
+                .id(Id::new(id))
+                .hint_text(hint)
+                .password(!show)
+                .desired_width(260.0),
+        )
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
         let p = self.pal;
         let dialog = std::mem::take(&mut self.dialog);
@@ -2071,6 +2207,8 @@ impl App {
             Dialog::None => {}
             Dialog::Compress(mut d) => {
                 let mut action: Option<bool> = None;
+                let missing: Vec<bool> = d.sources.iter().map(|s| !s.exists()).collect();
+                let any_missing = missing.iter().any(|m| *m);
                 let m = egui::Modal::new(Id::new("compress")).show(ctx, |ui| {
                     ui.set_width(580.0);
                     ui.heading(if d.adding_to_existing { "Add to archive" } else { "New archive" });
@@ -2085,8 +2223,13 @@ impl App {
                             for (i, s) in d.sources.iter().enumerate() {
                                 ui.horizontal(|ui| {
                                     let (icon, tint) = classify(&s.file_name().unwrap_or_default().to_string_lossy(), s.is_dir());
-                                    ui.label(RichText::new(icon).color(tint_color(tint, &p)));
-                                    ui.add(egui::Label::new(s.display().to_string()).truncate());
+                                    if missing[i] {
+                                        ui.label(RichText::new(ph::WARNING).color(p.danger));
+                                        ui.add(egui::Label::new(RichText::new(format!("{}  (not found)", s.display())).color(p.danger)).truncate());
+                                    } else {
+                                        ui.label(RichText::new(icon).color(tint_color(tint, &p)));
+                                        ui.add(egui::Label::new(s.display().to_string()).truncate());
+                                    }
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         if ui.add(egui::Button::new(ph::X).frame_when_inactive(false)).clicked() {
                                             remove = Some(i);
@@ -2099,6 +2242,9 @@ impl App {
                             }
                         });
                     });
+                    if any_missing {
+                        ui.label(RichText::new("Items marked \"not found\" no longer exist at that path. Remove them, or add them again from their new location.").small().color(p.danger));
+                    }
                     ui.horizontal(|ui| {
                         if ui.button(format!("{} Add files", ph::FILE_PLUS)).clicked() {
                             if let Some(f) = rfd::FileDialog::new().pick_files() {
@@ -2133,10 +2279,39 @@ impl App {
                     ui.add_space(8.0);
                     ui.label(RichText::new("EXCLUDE (comma-separated patterns, e.g. *.log, node_modules)").small().color(p.text_dim));
                     ui.add(egui::TextEdit::singleline(&mut d.exclude).desired_width(f32::INFINITY));
+                    let locked_already = d.adding_to_existing && self.archive.as_ref().is_some_and(|a| a.is_encrypted());
+                    if !locked_already {
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(if d.adding_to_existing { "SET A PASSWORD (optional, re-seals the whole archive)" } else { "PASSWORD (optional)" }).small().color(p.text_dim));
+                        ui.horizontal(|ui| {
+                            Self::password_field(ui, &mut d.password, "Password", d.show_password, "pw1");
+                            Self::password_field(ui, &mut d.confirm, "Confirm", d.show_password, "pw2");
+                            if ui.add(egui::Button::new(if d.show_password { ph::EYE_SLASH } else { ph::EYE }).frame_when_inactive(false)).on_hover_text("Show or hide").clicked() {
+                                d.show_password = !d.show_password;
+                            }
+                        });
+                        if !d.password.is_empty() {
+                            let (text, color) = if d.password != d.confirm {
+                                ("The two entries differ.", p.warn)
+                            } else if d.password.chars().count() < 8 {
+                                ("Short passwords are easy to guess; 12 or more characters is a good start.", p.warn)
+                            } else {
+                                ("Names, sizes and contents will all be sealed. There is no recovery without the password.", p.text_dim)
+                            };
+                            ui.label(RichText::new(text).small().color(color));
+                        }
+                    } else {
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(ph::LOCK_KEY).color(p.accent));
+                            ui.label(RichText::new("The archive stays sealed with its current password.").small().color(p.text_dim));
+                        });
+                    }
                     ui.add_space(16.0);
                     ui.horizontal(|ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let ok = !d.sources.is_empty() && !d.destination.as_os_str().is_empty();
+                            let pw_ok = d.password.is_empty() || d.password == d.confirm;
+                            let ok = !d.sources.is_empty() && !d.destination.as_os_str().is_empty() && !any_missing && pw_ok;
                             if self.primary_button(ui, &format!("{}  Compress", ph::PACKAGE), ok) {
                                 action = Some(true);
                             }
@@ -2217,7 +2392,10 @@ impl App {
                     });
                 });
                 match action {
-                    Some(true) => self.start_extract(d),
+                    Some(true) => {
+                        self.open_after = d.open_after;
+                        self.start_extract(d);
+                    }
                     Some(false) => {}
                     None => {
                         if !m.should_close() {
@@ -2226,16 +2404,90 @@ impl App {
                     }
                 }
             }
+            Dialog::Password(mut d) => {
+                let mut action: Option<bool> = None;
+                let m = egui::Modal::new(Id::new("password")).show(ctx, |ui| {
+                    ui.set_width(420.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(ph::LOCK_KEY).size(26.0).color(p.accent));
+                        ui.vertical(|ui| {
+                            ui.heading("This archive is locked");
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(
+                                        d.path.file_name().unwrap_or_default().to_string_lossy(),
+                                    )
+                                    .color(p.text_dim),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    });
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let r = Self::password_field(ui, &mut d.text, "Password", d.show, "unlock");
+                        if ui
+                            .add(
+                                egui::Button::new(if d.show { ph::EYE_SLASH } else { ph::EYE })
+                                    .frame_when_inactive(false),
+                            )
+                            .clicked()
+                        {
+                            d.show = !d.show;
+                        }
+                        if r.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            && !d.text.is_empty()
+                        {
+                            action = Some(true);
+                        }
+                        ctx.memory_mut(|mem| {
+                            if mem.focused().is_none() {
+                                mem.request_focus(Id::new("unlock"));
+                            }
+                        });
+                    });
+                    if let Some(e) = &d.error {
+                        ui.label(RichText::new(e.as_str()).color(p.danger));
+                    }
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if self.primary_button(
+                                ui,
+                                &format!("{}  Unlock", ph::LOCK_KEY_OPEN),
+                                !d.text.is_empty(),
+                            ) {
+                                action = Some(true);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(false);
+                            }
+                        });
+                    });
+                });
+                match action {
+                    Some(true) => self.open_path(d.path.clone(), Some(std::mem::take(&mut d.text))),
+                    Some(false) => self.pending = None,
+                    None => {
+                        if !m.should_close() {
+                            next = Dialog::Password(d);
+                        } else {
+                            self.pending = None;
+                        }
+                    }
+                }
+            }
             Dialog::Skipped(list) => {
                 let m = egui::Modal::new(Id::new("skipped")).show(ctx, |ui| {
                     ui.set_width(580.0);
-                    ui.heading(format!("{} items were not added", list.len()));
-                    ui.label(RichText::new("Links, special files and names that could not be extracted on every platform are skipped on purpose.").color(p.text_dim));
+                    ui.heading(format!("{} {} not added", list.len(), if list.len() == 1 { "item was" } else { "items were" }));
+                    ui.label(RichText::new("Links, special files and names that could not be extracted on every platform are skipped on purpose; missing files cannot be read.").color(p.text_dim));
                     ui.add_space(6.0);
                     egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                         for s in &list {
                             ui.label(s.path.display().to_string());
-                            ui.label(RichText::new(format!("    {}", s.reason)).small().color(p.warn));
+                            ui.label(RichText::new(format!("    {}", skip_reason(&s.reason))).small().color(p.warn));
                         }
                     });
                     ui.add_space(8.0);
@@ -2336,67 +2588,116 @@ impl App {
             Dialog::Settings => {
                 let (mut dark, mut accent) = (self.dark, self.accent);
                 let mut reset_ui = false;
+                let mut apply_explorer = false;
                 let m = egui::Modal::new(Id::new("settings")).show(ctx, |ui| {
-                    ui.set_width(520.0);
+                    ui.set_width(560.0);
                     ui.heading("Settings");
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        for (tab, label) in [(SettingsTab::General, "General"), (SettingsTab::Compression, "Compression"), (SettingsTab::Explorer, "Explorer")] {
+                            let selected = self.settings_tab == tab;
+                            let btn = egui::Button::new(RichText::new(label).family(if selected { theme::semibold() } else { egui::FontFamily::Proportional }))
+                                .fill(if selected { p.accent_soft } else { Color32::TRANSPARENT })
+                                .stroke(Stroke::NONE)
+                                .corner_radius(8);
+                            if ui.add(btn).clicked() {
+                                self.settings_tab = tab;
+                            }
+                        }
+                    });
+                    ui.separator();
+                    ui.add_space(6.0);
                     let section = |ui: &mut egui::Ui, title: &str| {
                         ui.add_space(6.0);
                         ui.label(RichText::new(title).small().color(p.text_dim));
-                        ui.separator();
                     };
-                    section(ui, "APPEARANCE");
-                    Self::settings_row(ui, &p, "Theme", |ui| {
-                        ui.selectable_value(&mut dark, true, format!("{} Dark", ph::MOON));
-                        ui.selectable_value(&mut dark, false, format!("{} Light", ph::SUN));
-                    });
-                    Self::settings_row(ui, &p, "Accent", |ui| {
-                        for a in Accent::ALL {
-                            let (c, _) = a.colors(dark);
-                            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
-                            let painter = ui.painter();
-                            painter.circle_filled(rect.center(), 9.0, c);
-                            if resp.hovered() {
-                                painter.circle_stroke(rect.center(), 11.5, Stroke::new(1.5, theme::with_alpha(p.text, 140)));
-                            }
-                            if a == accent {
-                                painter.circle_stroke(rect.center(), 11.5, Stroke::new(2.0, p.text));
-                            }
-                            if resp.on_hover_text(a.name()).clicked() {
-                                accent = a;
-                            }
+                    match self.settings_tab {
+                        SettingsTab::General => {
+                            section(ui, "APPEARANCE");
+                            Self::settings_row(ui, &p, "Theme", |ui| {
+                                ui.selectable_value(&mut dark, true, format!("{} Dark", ph::MOON));
+                                ui.selectable_value(&mut dark, false, format!("{} Light", ph::SUN));
+                            });
+                            Self::settings_row(ui, &p, "Accent", |ui| {
+                                for a in Accent::ALL {
+                                    let (c, _) = a.colors(dark);
+                                    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+                                    let painter = ui.painter();
+                                    painter.circle_filled(rect.center(), 9.0, c);
+                                    if resp.hovered() {
+                                        painter.circle_stroke(rect.center(), 11.5, Stroke::new(1.5, theme::with_alpha(p.text, 140)));
+                                    }
+                                    if a == accent {
+                                        painter.circle_stroke(rect.center(), 11.5, Stroke::new(2.0, p.text));
+                                    }
+                                    if resp.on_hover_text(a.name()).clicked() {
+                                        accent = a;
+                                    }
+                                }
+                            });
+                            section(ui, "VIEWING");
+                            Self::settings_row(ui, &p, "Default view mode", |ui| {
+                                for mode in [ViewMode::Text, ViewMode::Hex, ViewMode::Binary] {
+                                    ui.selectable_value(&mut self.view_mode, mode, mode.name());
+                                }
+                            });
+                            section(ui, "EXTRACTING");
+                            Self::settings_row(ui, &p, "Afterwards", |ui| {
+                                ui.checkbox(&mut self.open_after, "Open the destination folder");
+                            });
+                            section(ui, "LAYOUT");
+                            Self::settings_row(ui, &p, "Panels", |ui| {
+                                if ui.button(format!("{} Reset UI elements", ph::ARROW_COUNTER_CLOCKWISE)).on_hover_text("Restore panel sizes, sorting and scroll positions").clicked() {
+                                    reset_ui = true;
+                                }
+                            });
                         }
-                    });
-                    section(ui, "COMPRESSION");
-                    Self::settings_row(ui, &p, "Default level", |ui| {
-                        ui.add(egui::Slider::new(&mut self.level, 0..=9));
-                        ui.label(RichText::new(level_hint(self.level)).small().color(p.text_dim));
-                    });
-                    Self::settings_row(ui, &p, "Threads", |ui| {
-                        ui.add(egui::Slider::new(&mut self.threads, 0..=64));
-                        ui.label(RichText::new(if self.threads == 0 { "all cores" } else { "" }).small().color(p.text_dim));
-                    });
-                    Self::settings_row(ui, &p, "Executable filter", |ui| {
-                        ui.checkbox(&mut self.filter_auto, "Detect x86 / ARM64 / ARM / PowerPC / SPARC code and filter it");
-                    });
-                    ui.add_space(2.0);
-                    ui.label(RichText::new("Standard xz filters; the streams still open in xz and 7-Zip. Delta is tried on large non-code files.").small().color(p.text_dim));
-                    section(ui, "VIEWING");
-                    Self::settings_row(ui, &p, "Default view mode", |ui| {
-                        for mode in [ViewMode::Text, ViewMode::Hex, ViewMode::Binary] {
-                            ui.selectable_value(&mut self.view_mode, mode, mode.name());
+                        SettingsTab::Compression => {
+                            section(ui, "DEFAULTS FOR NEW ARCHIVES");
+                            Self::settings_row(ui, &p, "Level", |ui| {
+                                ui.add(egui::Slider::new(&mut self.level, 0..=9));
+                                ui.label(RichText::new(level_hint(self.level)).small().color(p.text_dim));
+                            });
+                            Self::settings_row(ui, &p, "Threads", |ui| {
+                                ui.add(egui::Slider::new(&mut self.threads, 0..=64));
+                                ui.label(RichText::new(if self.threads == 0 { "all cores" } else { "" }).small().color(p.text_dim));
+                            });
+                            Self::settings_row(ui, &p, "Executable filter", |ui| {
+                                ui.checkbox(&mut self.filter_auto, "Detect x86 / ARM64 / ARM / PowerPC / SPARC code and filter it");
+                            });
                         }
-                    });
-                    section(ui, "EXTRACTING");
-                    Self::settings_row(ui, &p, "Afterwards", |ui| {
-                        ui.checkbox(&mut self.open_after, "Open the destination folder");
-                    });
-                    section(ui, "LAYOUT");
-                    Self::settings_row(ui, &p, "Panels", |ui| {
-                        if ui.button(format!("{} Reset UI elements", ph::ARROW_COUNTER_CLOCKWISE)).on_hover_text("Restore panel sizes, sorting and scroll positions").clicked() {
-                            reset_ui = true;
+                        SettingsTab::Explorer => {
+                            if cfg!(windows) {
+                                ui.label(RichText::new("Everything here is written to your own user profile only; no administrator prompt.").small().color(p.text_dim));
+                                ui.add_space(6.0);
+                                ui.checkbox(&mut self.explorer_want.file_type, "Open .xzip files with xZip and show its icon");
+                                ui.checkbox(&mut self.explorer_want.archive_menu, "Right-click menu on .xzip files: Extract here, Extract to folder, Test");
+                                ui.checkbox(&mut self.explorer_want.add_menu, "Right-click menu on any file or folder: Add to xZip archive…");
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    if self.primary_button(ui, &format!("{}  Apply", ph::CHECK), true) {
+                                        apply_explorer = true;
+                                    }
+                                    if ui.button("Remove all").clicked() {
+                                        self.explorer_want = explorer::Integration::default();
+                                        apply_explorer = true;
+                                    }
+                                    if let Some((msg, err)) = &self.explorer_note {
+                                        ui.label(RichText::new(msg.as_str()).small().color(if *err { p.danger } else { p.ok }));
+                                    }
+                                });
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("On Windows 11 the entries appear under \"Show more options\" in the right-click menu.").small().color(p.text_dim));
+                            } else {
+                                ui.label(RichText::new("Explorer integration is a Windows feature. On this system, associate .xzip with xzip-gui in your desktop's file manager settings.").color(p.text_dim));
+                            }
+                            section(ui, "THE SAME FROM THE COMMAND LINE");
+                            egui::Frame::new().fill(p.bg).corner_radius(8).inner_margin(10).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(RichText::new(explorer::LAUNCH_HELP).monospace().size(11.5).color(p.text_dim));
+                            });
                         }
-                    });
+                    }
                     ui.add_space(14.0);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if close_btn(ui) {
@@ -2409,9 +2710,18 @@ impl App {
                     self.accent = accent;
                     self.retheme(ctx);
                 }
+                if apply_explorer {
+                    self.explorer_note = Some(match explorer::apply(self.explorer_want) {
+                        Ok(()) => ("Applied.".into(), false),
+                        Err(e) => (e, true),
+                    });
+                    self.explorer_want = explorer::status();
+                }
                 if reset_ui {
-                    ctx.memory_mut(|m| *m = Default::default());
+                    // panel sizes, scroll offsets, collapsing state; the style is left alone
+                    ctx.memory_mut(|mem| mem.data = Default::default());
                     self.sort = (SortCol::Name, false);
+                    self.retheme(ctx);
                     self.notify("UI elements reset.", false);
                     next = Dialog::Settings;
                 } else if !m.should_close() {
@@ -2421,13 +2731,16 @@ impl App {
             Dialog::Security => {
                 let m = egui::Modal::new(Id::new("security")).show(ctx, |ui| {
                     ui.set_width(680.0);
-                    ui.heading("What gets checked");
-                    ui.label(RichText::new("What happens between opening an archive and a file landing on your disk.").color(p.text_dim));
+                    ui.label(RichText::new("What happens between opening an archive and a file landing on your disk.").color(p.text));
                     ui.add_space(10.0);
                     egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
                         Self::security_section(ui, &p, ph::SHIELD_CHECK, "Before anything is shown", &[
                             "The whole file is hashed (SHA-256) and compared with its trailer. If it does not match, nothing is parsed: no header, no file list.",
                             "Then the header CRC, the manifest hash, every field's bounds and every path. Any failure refuses the archive.",
+                        ]);
+                        Self::security_section(ui, &p, ph::LOCK_KEY, "Passwords", &[
+                            "A password seals the manifest and every file with AES-256-GCM under a random key, which Argon2id wraps with your password. Names, sizes and contents are all hidden.",
+                            "The format and the program are public; the protection is the password. A wrong one fails cleanly, and nothing is decrypted until the hashes above match.",
                         ]);
                         Self::security_section(ui, &p, ph::PATH, "Paths", &[
                             "No \"..\", absolute paths, drive letters or backslashes.",
@@ -2461,7 +2774,7 @@ impl App {
                 let m = egui::Modal::new(Id::new("about")).show(ctx, |ui| {
                     ui.set_width(440.0);
                     ui.vertical_centered(|ui| {
-                        self.logo(ui, 80.0);
+                        self.logo(ui, 96.0);
                         ui.add_space(8.0);
                         ui.label(
                             RichText::new("xZip Archiver")
@@ -2473,11 +2786,17 @@ impl App {
                                 .color(p.text_dim),
                         );
                         ui.add_space(10.0);
-                        ui.label("Verified archives with Fast-LZMA2 compression.");
+                        ui.label("Secure Archiving with Cutting-Edge Compression");
                         ui.add_space(12.0);
                         ui.label(RichText::new("Made by Clinton Turner").family(theme::semibold()));
+                        ui.add_space(4.0);
+                        ui.hyperlink_to(
+                            format!("{} Buy Me a Coffee", ph::COFFEE),
+                            "https://buymeacoffee.com/theboneman",
+                        );
+                        ui.add_space(10.0);
                         ui.label(
-                            RichText::new("All rights reserved.")
+                            RichText::new("© 2026 Clinton Turner. All rights reserved.")
                                 .small()
                                 .color(p.text_dim),
                         );
@@ -2718,6 +3037,7 @@ impl eframe::App for App {
                         .inner_margin(6)
                         .stroke(Stroke::new(1.0, p.border))
                         .show(ui, |ui| {
+                            ui.set_min_height(ui.available_height());
                             self.table(ui);
                         });
                 });

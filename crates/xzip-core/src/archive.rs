@@ -14,6 +14,11 @@
 //! then header CRC, manifest hash, strict bounds on every field, every path. A
 //! file's stream is hashed before it goes to the decoder, and the output is hashed
 //! before it is written. See paths.rs and extract() for what is refused.
+//!
+//! With a password (header flag ENCRYPTED) a 128 B crypto block follows the header,
+//! the manifest and every stream are AES-256-GCM sealed, and the hashes above cover
+//! the sealed bytes, so verification still happens before anything is decrypted.
+//! Names, sizes and contents are all inside the sealed data. See crypto.rs.
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -22,6 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+use crate::crypto::{self, CryptoBlock, Key, CRYPTO_SIZE, FLAG_ENCRYPTED};
 use crate::error::{io_err, io_path, Error, Result};
 use crate::lzma2::Progress;
 use crate::paths::{archive_path_from_os, check_portable_path, collision_key};
@@ -164,10 +170,24 @@ pub struct ArchiveWriter {
     keys: std::collections::HashSet<String>,
     tmp: Option<tempfile::NamedTempFile>,
     pos: u64,
+    crypto: Option<(CryptoBlock, Key)>,
 }
 
 impl ArchiveWriter {
-    pub fn new(out_path: &Path, settings: &Settings) -> Result<Self> {
+    pub fn new(out_path: &Path, settings: &Settings, password: Option<&str>) -> Result<Self> {
+        let crypto = match password {
+            Some(pw) => Some(crypto::new_block(pw)?),
+            None => None,
+        };
+        Self::with_crypto(out_path, settings, crypto)
+    }
+
+    /// Reuse an existing archive's key, so a rebuild does not need the password again.
+    pub fn with_crypto(
+        out_path: &Path,
+        settings: &Settings,
+        crypto: Option<(CryptoBlock, Key)>,
+    ) -> Result<Self> {
         settings.validate()?;
         let dir = out_path
             .parent()
@@ -180,14 +200,25 @@ impl ArchiveWriter {
             .map_err(io_path("creating temp file in", &dir))?;
         tmp.write_all(&[0u8; HEADER_SIZE])
             .map_err(io_err("writing archive"))?;
+        let mut pos = HEADER_SIZE as u64;
+        if let Some((block, _)) = &crypto {
+            tmp.write_all(&block.pack())
+                .map_err(io_err("writing archive"))?;
+            pos += CRYPTO_SIZE as u64;
+        }
         Ok(ArchiveWriter {
             out_path: out_path.to_path_buf(),
             settings: settings.clone(),
             entries: Vec::new(),
             keys: Default::default(),
             tmp: Some(tmp),
-            pos: HEADER_SIZE as u64,
+            pos,
+            crypto,
         })
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.crypto.is_some()
     }
 
     fn check_new(&mut self, path: &str) -> Result<()> {
@@ -255,14 +286,9 @@ impl ArchiveWriter {
         self.add_bytes(path, &data, mtime, exec, progress)
     }
 
-    /// Copy an already-compressed stream from another archive (verified first).
+    /// Copy a compressed stream from another archive without recompressing. Pass the
+    /// plain .xz bytes from [`Archive::compressed`], which verifies them first.
     pub fn add_stream(&mut self, entry: &Entry, stream: &[u8]) -> Result<&Entry> {
-        if <[u8; 32]>::from(Sha256::digest(stream)) != entry.sha_stream {
-            return Err(Error::Integrity(format!(
-                "stream for {:?} does not match its hash",
-                entry.path
-            )));
-        }
         self.check_new(&entry.path)?;
         self.write_stream(
             &entry.path,
@@ -283,6 +309,14 @@ impl ArchiveWriter {
         mtime: i64,
         flags: u8,
     ) -> Result<&Entry> {
+        let sealed;
+        let stream = match &self.crypto {
+            Some((_, key)) => {
+                sealed = crypto::seal(key, stream, &[])?;
+                sealed.as_slice()
+            }
+            None => stream,
+        };
         let tmp = self.tmp.as_mut().expect("writer is open");
         tmp.write_all(stream).map_err(io_err("writing archive"))?;
         self.entries.push(Entry {
@@ -314,14 +348,30 @@ impl ArchiveWriter {
             e.pack(&mut manifest);
         }
         let manifest_offset = self.pos;
-        tmp.write_all(&manifest)
-            .map_err(io_err("writing archive"))?;
+        let flags = if self.crypto.is_some() {
+            FLAG_ENCRYPTED
+        } else {
+            0
+        };
+        let stored_len = manifest.len() as u64
+            + if self.crypto.is_some() {
+                crypto::OVERHEAD as u64
+            } else {
+                0
+            };
         let mut header = Vec::with_capacity(HEADER_SIZE);
         header.extend_from_slice(MAGIC);
         header.extend_from_slice(&VERSION.to_le_bytes());
-        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(&flags.to_le_bytes());
         header.extend_from_slice(&manifest_offset.to_le_bytes());
-        header.extend_from_slice(&(manifest.len() as u64).to_le_bytes());
+        header.extend_from_slice(&stored_len.to_le_bytes());
+        // the sealed manifest is bound to the header fields before it (its AAD)
+        if let Some((_, key)) = &self.crypto {
+            manifest = crypto::seal(key, &manifest, &header[..28])?;
+        }
+        debug_assert_eq!(manifest.len() as u64, stored_len);
+        tmp.write_all(&manifest)
+            .map_err(io_err("writing archive"))?;
         header.extend_from_slice(&Sha256::digest(&manifest));
         let crc = crc32fast::hash(&header);
         header.extend_from_slice(&crc.to_le_bytes());
@@ -550,6 +600,8 @@ pub fn collect_sources(
 }
 
 pub struct CreateOptions<'a> {
+    /// Encrypt with this password (names, sizes and contents are all hidden).
+    pub password: Option<&'a str>,
     pub settings: &'a Settings,
     pub follow_symlinks: bool,
     pub filter: &'a dyn Fn(&str) -> bool,
@@ -565,7 +617,7 @@ pub fn create_archive(
     let (items, skipped) = collect_sources(sources, opts.follow_symlinks, opts.filter);
     let total: u64 = items.iter().map(|i| i.size).sum();
     let mut done = 0u64;
-    let mut w = ArchiveWriter::new(out_path, opts.settings)?;
+    let mut w = ArchiveWriter::new(out_path, opts.settings, opts.password)?;
     for item in &items {
         if let Some(p) = progress {
             if !p(done, total, &item.archive_path) {
@@ -606,6 +658,16 @@ pub struct Archive {
     pub manifest_offset: u64,
     pub manifest_length: u64,
     pub archive_hash: [u8; 32],
+    crypto: Option<(CryptoBlock, Key)>,
+}
+
+/// Cheap check of the header flag, after the usual whole-file verification.
+pub fn is_encrypted_file(path: &Path) -> Result<bool> {
+    match open_archive_with(path, None) {
+        Ok(_) => Ok(false),
+        Err(Error::PasswordRequired) => Ok(true),
+        Err(e) => Err(e),
+    }
 }
 
 fn integrity<T>(msg: &str) -> Result<T> {
@@ -626,13 +688,23 @@ fn rd_i64(b: &[u8], p: usize) -> i64 {
 }
 
 pub fn open_archive(path: &Path) -> Result<Archive> {
+    open_archive_with(path, None)
+}
+
+pub fn open_archive_with(path: &Path, password: Option<&str>) -> Result<Archive> {
     let blob = fs::read(path).map_err(io_path("reading", path))?;
-    load_archive(blob, path)
+    load_archive_with(blob, path, password)
+}
+
+pub fn load_archive(blob: Vec<u8>, path: &Path) -> Result<Archive> {
+    load_archive_with(blob, path, None)
 }
 
 /// Verify and parse an archive held in memory. Nothing is interpreted until the
-/// whole-file hash matches.
-pub fn load_archive(blob: Vec<u8>, path: &Path) -> Result<Archive> {
+/// whole-file hash matches; nothing is decrypted until the sealed bytes match
+/// their hashes. A password-protected archive without a password fails with
+/// [`Error::PasswordRequired`] after those checks.
+pub fn load_archive_with(blob: Vec<u8>, path: &Path, password: Option<&str>) -> Result<Archive> {
     let n = blob.len();
     if n < HEADER_SIZE + TRAILER_SIZE {
         return integrity("file is too small to be an .xzip archive");
@@ -661,25 +733,51 @@ pub fn load_archive(blob: Vec<u8>, path: &Path) -> Result<Archive> {
             "unsupported archive version {version}"
         )));
     }
-    if rd_u32(&blob, 8) != 0 {
+    let flags = rd_u32(&blob, 8);
+    if flags & !FLAG_ENCRYPTED != 0 {
         return Err(Error::Archive("unknown header flags".into()));
+    }
+    let encrypted = flags & FLAG_ENCRYPTED != 0;
+    let payload_start = HEADER_SIZE + if encrypted { CRYPTO_SIZE } else { 0 };
+    if n < payload_start + TRAILER_SIZE {
+        return integrity("file is too small for its crypto block");
     }
     let m_off = rd_u64(&blob, 12);
     let m_len = rd_u64(&blob, 20);
-    if m_off < HEADER_SIZE as u64 || m_len < 4 || m_off.checked_add(m_len) != Some(t as u64) {
+    let min_len = if encrypted {
+        4 + crypto::OVERHEAD as u64
+    } else {
+        4
+    };
+    if m_off < payload_start as u64 || m_len < min_len || m_off.checked_add(m_len) != Some(t as u64)
+    {
         return integrity("manifest offset/length do not fit the file");
     }
-    let manifest = &blob[m_off as usize..(m_off + m_len) as usize];
-    if Sha256::digest(manifest)[..] != blob[28..60] {
+    let stored = &blob[m_off as usize..(m_off + m_len) as usize];
+    if Sha256::digest(stored)[..] != blob[28..60] {
         return integrity("manifest hash mismatch");
     }
+    let mut crypto_state = None;
+    let unsealed;
+    let manifest: &[u8] = if encrypted {
+        let block = CryptoBlock::parse(&blob[HEADER_SIZE..payload_start])?;
+        let Some(pw) = password else {
+            return Err(Error::PasswordRequired);
+        };
+        let key = crypto::unlock(&block, pw)?;
+        unsealed = crypto::open(&key, stored, &blob[..28])?;
+        crypto_state = Some((block, key));
+        &unsealed
+    } else {
+        stored
+    };
     let count = rd_u32(manifest, 0) as u64;
     if count > MAX_ENTRIES || count.saturating_mul(ENTRY_FIXED as u64) > m_len {
         return integrity("entry count does not fit the manifest");
     }
     let mut entries = Vec::with_capacity(count as usize);
     let mut pos = 4usize;
-    let mut next_offset = HEADER_SIZE as u64;
+    let mut next_offset = payload_start as u64;
     let ml = manifest.len();
     for i in 0..count {
         if pos + ENTRY_FIXED > ml {
@@ -763,6 +861,7 @@ pub fn load_archive(blob: Vec<u8>, path: &Path) -> Result<Archive> {
         manifest_offset: m_off,
         manifest_length: m_len,
         archive_hash,
+        crypto: crypto_state,
     })
 }
 
@@ -807,7 +906,16 @@ impl Archive {
         self.entries.iter().find(|e| e.path == path)
     }
 
-    /// The verified compressed stream of a file entry.
+    pub fn is_encrypted(&self) -> bool {
+        self.crypto.is_some()
+    }
+
+    /// The archive's crypto block and key, for a writer that keeps the same password.
+    pub fn crypto(&self) -> Option<(CryptoBlock, Key)> {
+        self.crypto.clone()
+    }
+
+    /// The verified bytes of a file entry as stored (sealed, if encrypted).
     pub fn stream(&self, e: &Entry) -> Result<&[u8]> {
         let data = &self.blob[e.data_offset as usize..(e.data_offset + e.data_length) as usize];
         if <[u8; 32]>::from(Sha256::digest(data)) != e.sha_stream {
@@ -817,6 +925,15 @@ impl Archive {
             )));
         }
         Ok(data)
+    }
+
+    /// The verified .xz stream of a file entry, decrypted when needed.
+    pub fn compressed(&self, e: &Entry) -> Result<std::borrow::Cow<'_, [u8]>> {
+        let stored = self.stream(e)?;
+        match &self.crypto {
+            Some((_, key)) => Ok(std::borrow::Cow::Owned(crypto::open(key, stored, &[])?)),
+            None => Ok(std::borrow::Cow::Borrowed(stored)),
+        }
     }
 
     /// Verified contents of a file: stream hash checked before decoding, exact size
@@ -831,8 +948,8 @@ impl Archive {
                 e.path, e.size, max_size
             )));
         }
-        let stream = self.stream(e)?;
-        let (data, _) = xz::decompress(stream, e.size as usize)?;
+        let stream = self.compressed(e)?;
+        let (data, _) = xz::decompress(&stream, e.size as usize)?;
         if data.len() as u64 != e.size {
             return Err(Error::Integrity(format!(
                 "{:?} decompressed to {} bytes, manifest says {}",
@@ -1059,7 +1176,11 @@ pub fn rebuild_archive(
     let total: u64 =
         items.iter().map(|i| i.size).sum::<u64>() + keep.iter().map(|e| e.data_length).sum::<u64>();
     let mut done = 0u64;
-    let mut w = ArchiveWriter::new(out_path, opts.settings)?;
+    // a new password wins; otherwise the archive stays as it was (locked or not)
+    let mut w = match opts.password {
+        Some(pw) => ArchiveWriter::new(out_path, opts.settings, Some(pw))?,
+        None => ArchiveWriter::with_crypto(out_path, opts.settings, archive.crypto())?,
+    };
     for e in keep {
         if let Some(p) = progress {
             if !p(done, total, &e.path) {
@@ -1069,7 +1190,7 @@ pub fn rebuild_archive(
         if e.is_dir() {
             w.add_dir(&e.path, e.mtime)?;
         } else {
-            w.add_stream(e, archive.stream(e)?)?;
+            w.add_stream(e, &archive.compressed(e)?)?;
             done += e.data_length;
         }
     }

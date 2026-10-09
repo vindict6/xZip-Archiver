@@ -67,6 +67,23 @@ struct Cli {
     /// Assume yes to questions
     #[arg(short = 'y', long, global = true)]
     yes: bool,
+    /// Password: encrypts a new archive, unlocks an existing one (prefer the
+    /// environment variable or --password-file; arguments show up in process lists)
+    #[arg(
+        short = 'p',
+        long,
+        global = true,
+        env = "XZIP_PASSWORD",
+        hide_env_values = true,
+        value_name = "PASSWORD"
+    )]
+    password: Option<String>,
+    /// Read the password from the first line of FILE
+    #[arg(long, global = true, value_name = "FILE", conflicts_with = "password")]
+    password_file: Option<PathBuf>,
+    /// Prompt for the password on the terminal (twice when creating)
+    #[arg(long, global = true, conflicts_with_all = ["password", "password_file"])]
+    ask_password: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -215,9 +232,59 @@ struct Ui {
     progress: bool,
     cancel: Arc<AtomicBool>,
     warnings: usize,
+    password: Option<String>,
+    ask_password: bool,
 }
 
 impl Ui {
+    /// The password for a new archive: given, or asked for twice when --ask-password.
+    fn password_for_create(&self) -> Result<Option<String>, Error> {
+        if let Some(p) = &self.password {
+            return Ok(Some(p.clone()));
+        }
+        if !self.ask_password {
+            return Ok(None);
+        }
+        let first = rpassword::prompt_password("Password: ").map_err(|e| Error::Io {
+            context: "reading password".into(),
+            source: e,
+        })?;
+        let second = rpassword::prompt_password("Confirm: ").map_err(|e| Error::Io {
+            context: "reading password".into(),
+            source: e,
+        })?;
+        if first != second {
+            return Err(Error::Settings("passwords do not match".into()));
+        }
+        if first.is_empty() {
+            return Err(Error::Settings("the password is empty".into()));
+        }
+        Ok(Some(first))
+    }
+
+    /// Open an archive, asking for its password on the terminal when it needs one
+    /// and none was given (only when there is a terminal to ask on).
+    fn open(&self, path: &Path) -> Result<Archive, Error> {
+        if path.as_os_str() == "-" {
+            let mut buf = Vec::new();
+            io::stdin().read_to_end(&mut buf).map_err(|e| Error::Io {
+                context: "reading stdin".into(),
+                source: e,
+            })?;
+            return archive::load_archive_with(buf, Path::new("<stdin>"), self.password.as_deref());
+        }
+        match archive::open_archive_with(path, self.password.as_deref()) {
+            Err(Error::PasswordRequired) if io::stdin().is_terminal() && !self.json => {
+                let pw = rpassword::prompt_password("Password: ").map_err(|e| Error::Io {
+                    context: "reading password".into(),
+                    source: e,
+                })?;
+                archive::open_archive_with(path, Some(&pw))
+            }
+            other => other,
+        }
+    }
+
     fn note(&self, msg: &str) {
         if !self.quiet && !self.json {
             eprintln!("{msg}");
@@ -326,19 +393,6 @@ fn select_entries<'a>(archive: &'a Archive, patterns: &[String]) -> Result<Vec<&
         ));
     }
     Ok(out)
-}
-
-fn read_archive(path: &Path) -> Result<Archive, Error> {
-    if path.as_os_str() == "-" {
-        let mut buf = Vec::new();
-        io::stdin().read_to_end(&mut buf).map_err(|e| Error::Io {
-            context: "reading stdin".into(),
-            source: e,
-        })?;
-        archive::load_archive(buf, Path::new("<stdin>"))
-    } else {
-        archive::open_archive(path)
-    }
 }
 
 fn mtime_string(t: i64) -> String {
@@ -466,10 +520,12 @@ fn cmd_add(ui: &mut Ui, a: AddArgs) -> Result<i32, Error> {
         return Ok(if ui.warnings > 0 { EXIT_WARN } else { EXIT_OK });
     }
 
+    let password = ui.password_for_create()?;
     let opts = CreateOptions {
         settings: &settings,
         follow_symlinks: a.follow_symlinks,
         filter: &filter,
+        password: password.as_deref(),
     };
     let bar = ui.bar(1, "compressing");
     let cancel = ui.cancel.clone();
@@ -553,7 +609,7 @@ fn shorten(s: &str, max: usize) -> String {
 }
 
 fn cmd_extract(ui: &mut Ui, x: ExtractArgs) -> Result<i32, Error> {
-    let archive = read_archive(&x.archive)?;
+    let archive = ui.open(&x.archive)?;
     let selected = select_entries(&archive, &x.paths).map_err(Error::Settings)?;
     let total: u64 = selected
         .iter()
@@ -637,7 +693,7 @@ fn cmd_extract(ui: &mut Ui, x: ExtractArgs) -> Result<i32, Error> {
 }
 
 fn cmd_list(ui: &Ui, l: ListArgs) -> Result<i32, Error> {
-    let archive = read_archive(&l.archive)?;
+    let archive = ui.open(&l.archive)?;
     let selected = select_entries(&archive, &l.paths).map_err(Error::Settings)?;
     if ui.json {
         let entries: Vec<_> = selected
@@ -735,7 +791,7 @@ fn hex(b: &[u8]) -> String {
 }
 
 fn cmd_test(ui: &Ui, t: ArchiveArg) -> Result<i32, Error> {
-    let archive = read_archive(&t.archive)?;
+    let archive = ui.open(&t.archive)?;
     let total: u64 = archive.entries.iter().map(|e| e.size).sum();
     let bar = ui.bar(total, "verifying");
     let cancel = ui.cancel.clone();
@@ -760,7 +816,7 @@ fn cmd_test(ui: &Ui, t: ArchiveArg) -> Result<i32, Error> {
 }
 
 fn cmd_info(ui: &Ui, t: ArchiveArg) -> Result<i32, Error> {
-    let archive = read_archive(&t.archive)?;
+    let archive = ui.open(&t.archive)?;
     let files: Vec<&Entry> = archive.entries.iter().filter(|e| !e.is_dir()).collect();
     let size: u64 = files.iter().map(|e| e.size).sum();
     let packed: u64 = files.iter().map(|e| e.data_length).sum();
@@ -774,11 +830,15 @@ fn cmd_info(ui: &Ui, t: ArchiveArg) -> Result<i32, Error> {
         println!(
             "{}",
             json!({"archive": t.archive, "bytes": archive.size(), "files": files.len(), "folders": archive.entries.len() - files.len(),
-            "size": size, "packed": packed, "sha256": hex(&archive.archive_hash), "longest_path": longest, "format_version": archive::VERSION})
+            "size": size, "packed": packed, "sha256": hex(&archive.archive_hash), "longest_path": longest, "format_version": archive::VERSION,
+            "encrypted": archive.is_encrypted()})
         );
     } else {
         println!("Archive:      {}", t.archive.display());
         println!("On disk:      {}", format_size(archive.size()));
+        if archive.is_encrypted() {
+            println!("Encryption:   AES-256-GCM, key from Argon2id (names and contents sealed)");
+        }
         println!("Files:        {}", files.len());
         println!("Folders:      {}", archive.entries.len() - files.len());
         println!("Contents:     {}", format_size(size));
@@ -797,7 +857,7 @@ fn cmd_info(ui: &Ui, t: ArchiveArg) -> Result<i32, Error> {
 }
 
 fn cmd_delete(ui: &mut Ui, d: DeleteArgs) -> Result<i32, Error> {
-    let archive = read_archive(&d.archive)?;
+    let archive = ui.open(&d.archive)?;
     let remove = select_entries(&archive, &d.paths).map_err(Error::Settings)?;
     let remove_set: std::collections::HashSet<&str> =
         remove.iter().map(|e| e.path.as_str()).collect();
@@ -811,6 +871,7 @@ fn cmd_delete(ui: &mut Ui, d: DeleteArgs) -> Result<i32, Error> {
         settings: &settings,
         follow_symlinks: false,
         filter: &|_| true,
+        password: None,
     };
     let bar = ui.bar(1, "rebuilding");
     let bar_ref = &bar;
@@ -860,6 +921,19 @@ fn main() {
         progress: !cli.quiet && !cli.no_progress && !cli.json && io::stderr().is_terminal(),
         cancel,
         warnings: 0,
+        password: None,
+        ask_password: cli.ask_password,
+    };
+    ui.password = match (&cli.password, &cli.password_file) {
+        (Some(p), _) => Some(p.clone()),
+        (None, Some(f)) => match std::fs::read_to_string(f) {
+            Ok(s) => Some(s.lines().next().unwrap_or("").to_string()),
+            Err(e) => {
+                anstream::eprintln!("error: reading {}: {e}", f.display());
+                std::process::exit(EXIT_USAGE);
+            }
+        },
+        _ => None,
     };
     let result = match cli.cmd {
         Cmd::Add(a) => cmd_add(&mut ui, a),
@@ -897,7 +971,7 @@ fn main() {
                 anstream::eprintln!("{red}error:{red:#} {e}");
             }
             match e {
-                Error::Settings(_) => EXIT_USAGE,
+                Error::Settings(_) | Error::PasswordRequired | Error::WrongPassword => EXIT_USAGE,
                 ref e if e.is_integrity() => EXIT_INTEGRITY,
                 _ => EXIT_ERROR,
             }
