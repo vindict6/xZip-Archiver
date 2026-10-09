@@ -32,8 +32,11 @@ line tool, no runtime to install.
   decompression bomb is refused before it is built. Details below.
 - **Paths up to 65,535 bytes.** Long paths work on Windows too.
 - **A desktop app that behaves like a file manager.** Browse folders inside an
-  archive, drag and drop to add, extract a selection, test, delete, view, sort,
+  archive, drag and drop to add, drag files out to the desktop (Windows and
+  macOS), extract a selection, test, delete, view as text, hex or binary, sort,
   search, dark and light themes, native dialogs, a details pane with hashes.
+  Names in any script display correctly; the app picks up the system's CJK
+  fonts when they are installed.
 - **A command line that follows the conventions you already know** (7z-style
   subcommands, tar-style `-C` and `--strip-components`, xz-style `-l 0..9`),
   with `--json`, proper exit codes, shell completions and a man page.

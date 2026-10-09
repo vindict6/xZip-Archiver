@@ -506,6 +506,45 @@ fn make_dir_link(target: &Path, link: &Path) -> bool {
 }
 
 #[test]
+fn non_ascii_names_round_trip() {
+    // Chinese, Japanese, fullwidth punctuation, accents: stored as NFC UTF-8, extracted intact
+    let d = tempfile::tempdir().unwrap();
+    let src = d.path().join("\u{8d44}\u{6599}"); // 资料
+    fs::create_dir_all(src.join("\u{5199}\u{771f}")).unwrap(); // 写真
+    let names = [
+        "\u{62a5}\u{544a}\u{ff04}100.txt",
+        "caf\u{e9} \u{2013} r\u{e9}sum\u{e9}.md",
+        "\u{5199}\u{771f}/\u{6771}\u{4eac}.jpg",
+        "\u{d55c}\u{ae00}.bin",
+    ];
+    for n in names {
+        fs::write(
+            src.join(n.replace('/', std::path::MAIN_SEPARATOR_STR)),
+            n.as_bytes(),
+        )
+        .unwrap();
+    }
+    let arc = d.path().join("u.xzip");
+    let (entries, skipped) =
+        create_archive(&arc, std::slice::from_ref(&src), &opts(&settings()), None).unwrap();
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(entries.iter().filter(|e| !e.is_dir()).count(), names.len());
+    let a = open_archive(&arc).unwrap();
+    let out = d.path().join("out");
+    a.extract(&out, None, &ExtractOptions::default(), None)
+        .unwrap();
+    for n in names {
+        let p = out
+            .join("\u{8d44}\u{6599}")
+            .join(n.replace('/', std::path::MAIN_SEPARATOR_STR));
+        assert_eq!(fs::read(&p).unwrap(), n.as_bytes(), "{n}");
+    }
+    assert!(a
+        .find("\u{8d44}\u{6599}/\u{62a5}\u{544a}\u{ff04}100.txt")
+        .is_some());
+}
+
+#[test]
 fn creation_enforces_portable_names() {
     let d = tempfile::tempdir().unwrap();
     let src = d.path().join("src");

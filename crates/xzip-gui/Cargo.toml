@@ -13,6 +13,7 @@ name = "xzip-gui"
 path = "src/main.rs"
 
 [dependencies]
+drag = "2.1.1"
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "persistence", "x11", "wayland"] }
 egui = "0.36"
 egui-phosphor = "0.14.0"

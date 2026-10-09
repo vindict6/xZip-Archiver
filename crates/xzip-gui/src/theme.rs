@@ -1,9 +1,11 @@
-//! Look and feel: palette, accent, typography, and a few painting helpers
-//! (gradients, rings, glows) that egui does not ship but a modern app needs.
+//! Look and feel: palette, accent, typography, logo, and painting helpers
+//! (gradients, rings, glows, grips) that egui does not ship.
 
 use egui::{
     Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Pos2, Rect, Stroke, Visuals,
 };
+
+pub const LOGO_PNG: &[u8] = include_bytes!("../../../assets/icon.png");
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Accent {
@@ -40,7 +42,6 @@ impl Accent {
             .unwrap_or(Accent::Cyan)
     }
 
-    /// (main colour, second colour of the gradient)
     pub fn colors(self, dark: bool) -> (Color32, Color32) {
         match (self, dark) {
             (Accent::Cyan, true) => (
@@ -93,7 +94,7 @@ pub struct Palette {
     pub bg2: Color32,
     pub panel: Color32,
     pub card: Color32,
-    pub card_hover: Color32,
+    pub hover: Color32,
     pub stripe: Color32,
     pub text: Color32,
     pub text_dim: Color32,
@@ -110,41 +111,43 @@ pub struct Palette {
 pub fn palette(dark: bool, accent: Accent) -> Palette {
     let (a, a2) = accent.colors(dark);
     if dark {
+        let card = Color32::from_rgb(28, 33, 46);
         Palette {
             bg: Color32::from_rgb(14, 17, 25),
             bg2: Color32::from_rgb(22, 26, 40),
             panel: Color32::from_rgb(20, 24, 34),
-            card: Color32::from_rgb(28, 33, 46),
-            card_hover: Color32::from_rgb(36, 42, 58),
+            card,
+            hover: mix(card, a, 0.16),
             stripe: Color32::from_rgb(24, 29, 40),
             text: Color32::from_rgb(232, 236, 243),
-            text_dim: Color32::from_rgb(140, 150, 170),
+            text_dim: Color32::from_rgb(150, 160, 180),
             accent: a,
             accent2: a2,
-            accent_soft: mix(a, Color32::from_rgb(20, 24, 34), 0.78),
+            accent_soft: mix(a, Color32::from_rgb(20, 24, 34), 0.72),
             ok: Color32::from_rgb(96, 211, 148),
             warn: Color32::from_rgb(245, 189, 78),
             danger: Color32::from_rgb(244, 97, 97),
-            border: Color32::from_rgb(44, 51, 68),
+            border: Color32::from_rgb(46, 54, 72),
             dark,
         }
     } else {
+        let card = Color32::from_rgb(255, 255, 255);
         Palette {
             bg: Color32::from_rgb(243, 245, 250),
             bg2: Color32::from_rgb(232, 236, 246),
             panel: Color32::from_rgb(255, 255, 255),
-            card: Color32::from_rgb(255, 255, 255),
-            card_hover: Color32::from_rgb(238, 242, 250),
+            card,
+            hover: mix(card, a, 0.12),
             stripe: Color32::from_rgb(247, 249, 253),
             text: Color32::from_rgb(26, 30, 40),
-            text_dim: Color32::from_rgb(108, 118, 138),
+            text_dim: Color32::from_rgb(100, 110, 130),
             accent: a,
             accent2: a2,
-            accent_soft: mix(a, Color32::WHITE, 0.82),
+            accent_soft: mix(a, Color32::WHITE, 0.80),
             ok: Color32::from_rgb(28, 150, 90),
             warn: Color32::from_rgb(200, 135, 15),
             danger: Color32::from_rgb(210, 55, 55),
-            border: Color32::from_rgb(220, 226, 236),
+            border: Color32::from_rgb(218, 224, 235),
             dark,
         }
     }
@@ -165,6 +168,51 @@ pub fn with_alpha(c: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
 }
 
+/// Fonts the OS ships for scripts our bundled font does not cover (CJK above all).
+/// Loaded only if present; nothing breaks when they are missing.
+fn system_fallback_fonts() -> Vec<(String, FontData)> {
+    let candidates: &[(&str, u32)] = if cfg!(target_os = "windows") {
+        &[
+            ("C:/Windows/Fonts/msyh.ttc", 0), // Microsoft YaHei (Simplified Chinese)
+            ("C:/Windows/Fonts/meiryo.ttc", 0), // Japanese
+            ("C:/Windows/Fonts/malgun.ttf", 0), // Korean
+            ("C:/Windows/Fonts/msjh.ttc", 0), // Traditional Chinese
+            ("C:/Windows/Fonts/segoeui.ttf", 0),
+            ("C:/Windows/Fonts/seguisym.ttf", 0),
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[
+            ("/System/Library/Fonts/PingFang.ttc", 0),
+            ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
+            ("/System/Library/Fonts/Supplemental/Arial Unicode.ttf", 0),
+            ("/System/Library/Fonts/Apple Symbols.ttf", 0),
+        ]
+    } else {
+        &[
+            ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+            ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 0),
+            ("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", 0),
+            (
+                "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+                0,
+            ),
+            ("/usr/share/fonts/wqy-microhei/wqy-microhei.ttc", 0),
+            ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
+            ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0),
+            ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0),
+        ]
+    };
+    let mut out = Vec::new();
+    for (path, index) in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            let mut data = FontData::from_owned(bytes);
+            data.index = *index;
+            out.push((format!("sys:{path}"), data));
+        }
+    }
+    out
+}
+
 pub fn fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert(
@@ -183,7 +231,7 @@ pub fn fonts() -> FontDefinitions {
     fonts
         .families
         .insert(semibold(), vec!["inter-semibold".into(), "inter".into()]);
-    // Phosphor goes last as a fallback. The bundled Inter files have their private-use
+    // Phosphor last as a fallback. The bundled Inter files have their private-use
     // glyphs stripped (fonttools), otherwise they would shadow some of the icons.
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     let icons: Vec<String> = fonts
@@ -197,11 +245,25 @@ pub fn fonts() -> FontDefinitions {
         })
         .unwrap_or_default();
     fonts.families.entry(semibold()).or_default().extend(icons);
+    // OS fonts for Chinese, Japanese, Korean and other scripts, appended to every family
+    for (name, data) in system_fallback_fonts() {
+        fonts.font_data.insert(name.clone(), data.into());
+        for family in [FontFamily::Proportional, semibold(), FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(name.clone());
+        }
+    }
     fonts
 }
 
 pub fn semibold() -> FontFamily {
     FontFamily::Name("semibold".into())
+}
+
+pub fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let img = image::load_from_memory(LOGO_PNG).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+    Some(ctx.load_texture("logo", color, egui::TextureOptions::LINEAR))
 }
 
 pub fn apply(ctx: &egui::Context, p: &Palette) {
@@ -226,20 +288,29 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
     let r = CornerRadius::same(9);
     v.widgets.noninteractive.bg_fill = p.card;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
     v.widgets.noninteractive.corner_radius = r;
     v.widgets.inactive.bg_fill = p.card;
     v.widgets.inactive.weak_bg_fill = p.card;
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, p.border);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, p.text);
     v.widgets.inactive.corner_radius = r;
-    v.widgets.hovered.bg_fill = p.card_hover;
-    v.widgets.hovered.weak_bg_fill = p.card_hover;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, with_alpha(p.accent, 180));
+    // hover: a tint of the accent over the card, text unchanged (no white flash)
+    v.widgets.hovered.bg_fill = p.hover;
+    v.widgets.hovered.weak_bg_fill = p.hover;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, with_alpha(p.accent, 160));
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0, p.text);
     v.widgets.hovered.corner_radius = r;
+    v.widgets.hovered.expansion = 0.0;
     v.widgets.active.bg_fill = p.accent_soft;
     v.widgets.active.weak_bg_fill = p.accent_soft;
     v.widgets.active.bg_stroke = Stroke::new(1.0, p.accent);
+    v.widgets.active.fg_stroke = Stroke::new(1.0, p.text);
     v.widgets.active.corner_radius = r;
-    v.widgets.open.bg_fill = p.card_hover;
+    v.widgets.active.expansion = 0.0;
+    v.widgets.open.bg_fill = p.hover;
+    v.widgets.open.weak_bg_fill = p.hover;
+    v.widgets.open.fg_stroke = Stroke::new(1.0, p.text);
     v.widgets.open.corner_radius = r;
     v.text_cursor.stroke.color = p.accent;
     let theme = if p.dark {
@@ -257,6 +328,9 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
         style.spacing.interact_size.y = 30.0;
         style.spacing.scroll.bar_width = 8.0;
         style.spacing.scroll.floating = true;
+        // text is never selectable here: it keeps the row click/drag handling simple
+        // and gets rid of the I-beam cursor
+        style.interaction.selectable_labels = false;
         style.text_styles.insert(
             egui::TextStyle::Body,
             egui::FontId::new(14.0, FontFamily::Proportional),
@@ -282,7 +356,6 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
 
 // ---- painting helpers ---------------------------------------------------------------
 
-/// Vertical gradient fill.
 pub fn gradient_rect(painter: &egui::Painter, rect: Rect, top: Color32, bottom: Color32) {
     let mut mesh = egui::Mesh::default();
     mesh.colored_vertex(rect.left_top(), top);
@@ -294,7 +367,6 @@ pub fn gradient_rect(painter: &egui::Painter, rect: Rect, top: Color32, bottom: 
     painter.add(egui::Shape::mesh(mesh));
 }
 
-/// Horizontal gradient fill (progress bars, the logo tile).
 pub fn gradient_rect_h(painter: &egui::Painter, rect: Rect, left: Color32, right: Color32) {
     let mut mesh = egui::Mesh::default();
     mesh.colored_vertex(rect.left_top(), left);
@@ -306,7 +378,6 @@ pub fn gradient_rect_h(painter: &egui::Painter, rect: Rect, left: Color32, right
     painter.add(egui::Shape::mesh(mesh));
 }
 
-/// A soft radial glow: concentric circles fading out.
 pub fn glow(painter: &egui::Painter, center: Pos2, radius: f32, color: Color32) {
     let steps = 8;
     for i in (1..=steps).rev() {
@@ -343,4 +414,23 @@ pub fn ring(
         })
         .collect();
     painter.add(egui::Shape::line(pts, Stroke::new(width, color)));
+}
+
+/// A resize grip drawn on a panel edge: a thicker line with a pill in the middle.
+pub fn grip(painter: &egui::Painter, x: f32, top: f32, bottom: f32, hot: bool, p: &Palette) {
+    let color = if hot { p.accent } else { p.border };
+    painter.line_segment(
+        [Pos2::new(x, top), Pos2::new(x, bottom)],
+        Stroke::new(3.0, color),
+    );
+    let mid = (top + bottom) / 2.0;
+    let pill = Rect::from_center_size(Pos2::new(x, mid), egui::vec2(7.0, 44.0));
+    painter.rect_filled(pill, 3.5, color);
+    for dy in [-10.0, 0.0, 10.0] {
+        painter.circle_filled(
+            Pos2::new(x, mid + dy),
+            1.4,
+            if hot { p.bg } else { p.panel },
+        );
+    }
 }
