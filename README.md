@@ -198,3 +198,5 @@ crates/xzip-gui    the desktop app (egui)
 
 Clinton Turner. All rights reserved; see `LICENSE`. Third-party components and
 their licenses are listed in `THIRD_PARTY.md`.
+
+project uses the SignPath Foundation for code signing.
