@@ -373,6 +373,61 @@ fn menu_text(icon: &str, text: &str) -> String {
     format!(" {icon}  {text} ")
 }
 
+/// A button with no frame at rest and a painted hover tint, sized once so it never
+/// moves when the pointer reaches it (egui's framed buttons grow by the stroke).
+fn flat_button(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    text: impl Into<egui::WidgetText>,
+    min: Vec2,
+    enabled: bool,
+) -> egui::Response {
+    let text: egui::WidgetText = text.into();
+    let galley = text.into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Button,
+    );
+    let pad = ui.spacing().button_padding;
+    let size = Vec2::new(
+        (galley.size().x + 2.0 * pad.x).max(min.x),
+        (galley.size().y + 2.0 * pad.y).max(min.y),
+    );
+    let (rect, resp) = ui.allocate_exact_size(
+        size,
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    if ui.is_rect_visible(rect) {
+        if enabled && (resp.hovered() || resp.is_pointer_button_down_on()) {
+            let fill = if resp.is_pointer_button_down_on() {
+                p.accent_soft
+            } else {
+                p.hover
+            };
+            ui.painter().rect(
+                rect,
+                9.0,
+                fill,
+                Stroke::new(1.0, theme::with_alpha(p.accent, 160)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let color = if enabled {
+            p.text
+        } else {
+            theme::with_alpha(p.text, 90)
+        };
+        ui.painter()
+            .galley(rect.center() - galley.size() / 2.0, galley, color);
+    }
+    resp
+}
+
 fn card(p: &Palette) -> egui::Frame {
     egui::Frame::new()
         .fill(p.card)
@@ -1016,6 +1071,36 @@ impl App {
         });
     }
 
+    /// "New": ask where the archive goes, then collect its contents in the dialog.
+    fn action_new_named(&mut self) {
+        let Some(dest) = rfd::FileDialog::new()
+            .add_filter("xzip archive", &["xzip"])
+            .set_file_name("archive.xzip")
+            .set_title("Name the new archive")
+            .save_file()
+        else {
+            return;
+        };
+        let dest = if dest
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("xzip"))
+        {
+            dest
+        } else {
+            dest.with_extension("xzip")
+        };
+        self.dialog = Dialog::Compress(CompressDialog {
+            sources: Vec::new(),
+            destination: dest,
+            level: self.level,
+            exclude: String::new(),
+            adding_to_existing: false,
+            password: String::new(),
+            confirm: String::new(),
+            show_password: false,
+        });
+    }
+
     fn action_add(&mut self, sources: Vec<PathBuf>) {
         match &self.archive {
             Some(a) => {
@@ -1089,10 +1174,13 @@ impl App {
         enabled: bool,
         tip: &str,
     ) -> bool {
-        let btn = egui::Button::new(format!("{icon}  {text}"))
-            .frame_when_inactive(false)
-            .min_size(Vec2::new(0.0, 34.0));
-        let resp = ui.add_enabled(enabled, btn);
+        let resp = flat_button(
+            ui,
+            &self.pal,
+            format!("{icon}  {text}"),
+            Vec2::new(0.0, 34.0),
+            enabled,
+        );
         let resp = if tip.is_empty() {
             resp
         } else {
@@ -1102,10 +1190,12 @@ impl App {
     }
 
     fn icon_button(&self, ui: &mut egui::Ui, icon: &str, tip: &str) -> bool {
-        ui.add(
-            egui::Button::new(RichText::new(icon).size(17.0))
-                .frame_when_inactive(false)
-                .min_size(Vec2::splat(32.0)),
+        flat_button(
+            ui,
+            &self.pal,
+            RichText::new(icon).size(17.0),
+            Vec2::splat(32.0),
+            true,
         )
         .on_hover_text(tip)
         .clicked()
@@ -1132,9 +1222,7 @@ impl App {
                 !busy,
                 "Create an archive (Ctrl+N)",
             ) {
-                if let Some(files) = rfd::FileDialog::new().pick_files() {
-                    self.action_new(files);
-                }
+                self.action_new_named();
             }
             // Open: a menu with Browse and the recent list
             let mut browse = false;
@@ -1381,11 +1469,7 @@ impl App {
                 )
                 .on_hover_text(hex(&a.archive_hash));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new(ph::COPY).small())
-                                .frame_when_inactive(false),
-                        )
+                    if flat_button(ui, &p, RichText::new(ph::COPY).small(), Vec2::ZERO, true)
                         .on_hover_text("Copy the archive hash")
                         .clicked()
                     {
@@ -1481,13 +1565,15 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("SHA-256").small().color(p.text_dim));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui
-                                    .add(
-                                        egui::Button::new(RichText::new(ph::COPY).small())
-                                            .frame_when_inactive(false),
-                                    )
-                                    .on_hover_text("Copy hash")
-                                    .clicked()
+                                if flat_button(
+                                    ui,
+                                    &p,
+                                    RichText::new(ph::COPY).small(),
+                                    Vec2::ZERO,
+                                    true,
+                                )
+                                .on_hover_text("Copy hash")
+                                .clicked()
                                 {
                                     copy = Some(hex(&e.sha_data));
                                 }
@@ -1644,9 +1730,7 @@ impl App {
                                 .frame(egui::Frame::new());
                             ui.add(edit);
                             if !self.search.is_empty()
-                                && ui
-                                    .add(egui::Button::new(ph::X).frame_when_inactive(false))
-                                    .clicked()
+                                && flat_button(ui, &p, ph::X, Vec2::ZERO, true).clicked()
                             {
                                 self.search.clear();
                             }
@@ -1714,10 +1798,7 @@ impl App {
             let text = RichText::new(format!(" {label} {arrow}"))
                 .small()
                 .color(p.text_dim);
-            if ui
-                .add(egui::Button::new(text).frame_when_inactive(false))
-                .clicked()
-            {
+            if flat_button(ui, &p, text, Vec2::ZERO, true).clicked() {
                 *out = Some(col);
             }
         };
@@ -1977,10 +2058,7 @@ impl App {
                     .small()
                     .color(p.text_dim),
                 );
-                if ui
-                    .add(egui::Button::new(format!("{} Cancel", ph::X)).frame_when_inactive(false))
-                    .clicked()
-                {
+                if flat_button(ui, &p, format!("{} Cancel", ph::X), Vec2::ZERO, true).clicked() {
                     job.cancel.store(true, Ordering::Relaxed);
                 }
             }
@@ -2057,9 +2135,7 @@ impl App {
             self.action_open();
         }
         if new_files {
-            if let Some(files) = rfd::FileDialog::new().pick_files() {
-                self.action_new(files);
-            }
+            self.action_new_named();
         }
     }
 
@@ -2231,7 +2307,7 @@ impl App {
                                         ui.add(egui::Label::new(s.display().to_string()).truncate());
                                     }
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if ui.add(egui::Button::new(ph::X).frame_when_inactive(false)).clicked() {
+                                        if flat_button(ui, &p, ph::X, Vec2::ZERO, true).clicked() {
                                             remove = Some(i);
                                         }
                                     });
@@ -2248,7 +2324,7 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui.button(format!("{} Add files", ph::FILE_PLUS)).clicked() {
                             if let Some(f) = rfd::FileDialog::new().pick_files() {
-                                d.sources.extend(f);
+                                d.sources.extend(f.into_iter().filter(|p| p.exists()));
                             }
                         }
                         if ui.button(format!("{} Add folder", ph::FOLDER_PLUS)).clicked() {
@@ -2286,7 +2362,7 @@ impl App {
                         ui.horizontal(|ui| {
                             Self::password_field(ui, &mut d.password, "Password", d.show_password, "pw1");
                             Self::password_field(ui, &mut d.confirm, "Confirm", d.show_password, "pw2");
-                            if ui.add(egui::Button::new(if d.show_password { ph::EYE_SLASH } else { ph::EYE }).frame_when_inactive(false)).on_hover_text("Show or hide").clicked() {
+                            if flat_button(ui, &p, if d.show_password { ph::EYE_SLASH } else { ph::EYE }, Vec2::ZERO, true).on_hover_text("Show or hide").clicked() {
                                 d.show_password = !d.show_password;
                             }
                         });
@@ -2426,12 +2502,14 @@ impl App {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         let r = Self::password_field(ui, &mut d.text, "Password", d.show, "unlock");
-                        if ui
-                            .add(
-                                egui::Button::new(if d.show { ph::EYE_SLASH } else { ph::EYE })
-                                    .frame_when_inactive(false),
-                            )
-                            .clicked()
+                        if flat_button(
+                            ui,
+                            &p,
+                            if d.show { ph::EYE_SLASH } else { ph::EYE },
+                            Vec2::ZERO,
+                            true,
+                        )
+                        .clicked()
                         {
                             d.show = !d.show;
                         }
@@ -2908,9 +2986,7 @@ impl App {
                 self.action_open();
             }
             if new {
-                if let Some(files) = rfd::FileDialog::new().pick_files() {
-                    self.action_new(files);
-                }
+                self.action_new_named();
             }
             if esc {
                 if let Some(job) = &self.job {
